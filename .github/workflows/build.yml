@@ -15,7 +15,11 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
           cache: maven
+      - name: Install ProtocolLib dev-build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tinkers-test/install-protocollib-dev.sh
       - name: Verify
         run: mvn --batch-mode --no-transfer-progress clean verify

@@ -8,6 +8,7 @@ class ExtensionRoutes {
     private data class Registration(val owner: Plugin, val route: ArcMenuRoute)
     private val routes = linkedMapOf<String, Registration>()
 
+    @Synchronized
     fun register(owner: Plugin, routeId: String, route: ArcMenuRoute) {
         require(owner.isEnabled) { "禁用的插件不能注册 ArcMenu 路由" }
         require(ROUTE.matches(routeId)) { "扩展路由必须为 namespace:path，例如 myaddon:shop" }
@@ -16,17 +17,19 @@ class ExtensionRoutes {
         routes[routeId] = Registration(owner, route)
     }
 
+    @Synchronized
     fun unregister(owner: Plugin) {
         routes.entries.removeIf { it.value.owner === owner }
     }
 
     /** null means there is no registered route; false is a route handler's explicit refusal. */
     fun dispatch(player: Player, routeId: String, arguments: List<String>): Boolean? {
-        val registration = routes[routeId] ?: return null
+        val registration = synchronized(this) { routes[routeId] } ?: return null
         if (!registration.owner.isEnabled) return false
         return registration.route.open(player, arguments.toList())
     }
 
+    @Synchronized
     fun ids(): Set<String> = routes.keys.toSet()
 
     private companion object {

@@ -1,0 +1,71 @@
+# ArcMenu A1：mouse（固定摄像机 + 虚拟光标）模式与跨区域传送重锚。
+# mouse 模式下 ArcMenu 用 ProtocolLib 吞掉视角包、给客户端设摄像机实体并发合成位置包取样；光标位移 = 视角变化 × 灵敏度 2（像素 / 度）。
+# card-area 中心 x = -27.8 → 左转约 14°。之后切回 touch，开着菜单传送到 6000,250,6000（另一个 Folia 区域）看重锚，再回原地数旧实体。
+# flock /tmp/tc-testserver.lock ./run.sh -s <本文件绝对路径> -u TcGuiBot --op
+connect
+respawn
+cmd gamemode creative
+wait 100
+cmd execute in minecraft:overworld run tp @s 2600.5 250 2600.5 0 0
+wait 40
+cmd fill 2596 249 2596 2604 249 2604 minecraft:glass
+wait 10
+cmd tp @s 2600.5 250 2600.5 0 0
+cmd arcmenu mode mouse
+wait 10
+cmd arcmenu open example
+wait 60
+dump mouse_opened
+expect-not displays=0/0
+hud off
+wait 2
+screenshot arcmenu_a1_mouse_open
+hud on
+look -14 0
+wait 20
+hud off
+wait 2
+screenshot arcmenu_a1_mouse_hover_card
+hud on
+use
+wait 10
+dump mouse_click_card
+expect Right-click reached card-area
+cmd arcmenu close
+wait 40
+dump mouse_closed
+expect displays=0/
+cmd arcmenu mode touch
+wait 5
+cmd tp @s 2600.5 250 2600.5 0 0
+wait 10
+cmd arcmenu open example
+wait 40
+dump touch_open_before_tp
+expect-not displays=0/0
+cmd execute in minecraft:overworld run tp @s 6000.5 250 6000.5 0 0
+wait 10
+cmd fill 5996 249 5996 6004 249 6004 minecraft:glass
+cmd tp @s 6000.5 250 6000.5 0 0
+wait 60
+dump after_far_tp
+expect-not displays=0/0
+hud off
+wait 2
+screenshot arcmenu_a1_after_far_tp
+hud on
+cmd execute if entity @e[type=minecraft:text_display,distance=..16]
+wait 5
+dump far_tp_entities
+expect Test passed
+cmd arcmenu close
+wait 30
+cmd execute in minecraft:overworld run tp @s 2600.5 250 2600.5 0 0
+wait 60
+cmd execute if entity @e[type=minecraft:text_display,distance=..16]
+wait 5
+dump old_place_entities
+expect Test failed
+cmd arcmenu performance
+wait 5
+dump perf

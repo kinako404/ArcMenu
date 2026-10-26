@@ -1,0 +1,76 @@
+# ArcMenu A1（Folia / 26.3 适配验收）：原版客户端打开自带示例菜单 example → details → 返回 → Shift+F 关闭，touch（准星）模式。
+# 屏幕平面在打开时按玩家 yaw 放在眼前 3 格；画布 320×180 像素、42.7 像素 / 格，后台区域坐标是画布像素（中心为原点，+x 是玩家右手边）。
+# card-area 中心 x = -27.8 → 左转约 12°；model-area 中心 x = 30.7 → 右转约 13.5°；details 的 back-area 中心 y = -17.1 → 低头约 7.6°。
+# flock /tmp/tc-testserver.lock ./run.sh -s <本文件绝对路径> -u TcGuiBot --op   （在 /root/kinako/java/Minecraft/mc-test-client）
+connect
+respawn
+cmd gamemode creative
+wait 100
+cmd execute in minecraft:overworld run tp @s 2600.5 250 2600.5 0 0
+wait 40
+cmd fill 2596 249 2596 2604 249 2604 minecraft:glass
+wait 10
+cmd tp @s 2600.5 250 2600.5 0 0
+cmd arcmenu mode touch
+wait 10
+cmd kill @e[type=!player,distance=..16]
+wait 5
+cmd execute if entity @e[type=minecraft:text_display,distance=..16]
+wait 5
+dump before
+expect Test failed
+cmd arcmenu open example
+wait 40
+dump opened
+expect-not displays=0/0
+screenshot arcmenu_a1_example
+cmd execute if entity @e[type=minecraft:text_display,distance=..16]
+wait 5
+dump opened_entities
+expect Test passed
+look -12 0
+wait 15
+dump hover_card
+screenshot arcmenu_a1_hover_card
+use
+wait 10
+dump click_card
+expect Right-click reached card-area
+look 13.5 0
+wait 15
+screenshot arcmenu_a1_hover_model
+use
+wait 30
+dump details
+screenshot arcmenu_a1_details
+look 0 7.6
+wait 15
+screenshot arcmenu_a1_hover_back
+use
+wait 30
+dump back_to_example
+screenshot arcmenu_a1_back_example
+look 0 0
+wait 5
+cmd arcmenu status
+wait 5
+dump status_open
+sneak on
+wait 2
+swap
+wait 2
+sneak off
+wait 30
+dump closed
+expect displays=0/
+screenshot arcmenu_a1_closed
+cmd execute if entity @e[type=minecraft:text_display,distance=..16]
+wait 5
+dump closed_entities
+expect Test failed
+cmd arc
+wait 40
+dump reopened
+expect-not displays=0/0
+screenshot arcmenu_a1_reopened_before_quit
+disconnect

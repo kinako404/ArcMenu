@@ -1,6 +1,7 @@
 package com.fentai.arcmenu.paper.resource
 
 import com.fentai.arcmenu.paper.localization.LanguageManager
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import org.bukkit.event.Event
 import org.bukkit.event.EventPriority
 import org.bukkit.event.HandlerList
@@ -112,7 +113,7 @@ class CraftEngineBridge(
                     val firstReload = runCatching {
                         event.javaClass.getMethod("isFirstReload").invoke(event) as Boolean
                     }.getOrDefault(false)
-                    plugin.server.scheduler.runTask(plugin, Runnable {
+                    ArcScheduler.globalLater(plugin, Runnable {
                         if (plugin.isEnabled) onReloadReady(firstReload)
                     })
                 }, plugin, true,

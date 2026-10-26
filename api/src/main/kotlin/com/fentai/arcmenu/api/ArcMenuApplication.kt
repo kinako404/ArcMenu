@@ -16,7 +16,8 @@ fun interface ArcMenuApplication {
 
 /**
  * Per-player application callbacks. Extend this class from Java and override only the events used by the app.
- * Every callback is invoked on the Bukkit server thread.
+ * Every callback is invoked on the thread that owns the player: the main thread on Paper, the player's
+ * region thread on Folia.
  */
 abstract class ArcMenuApplicationSession {
     open fun onSurfaceChanged(event: ArcMenuSurfaceEvent) = Unit
@@ -48,8 +49,13 @@ interface ArcMenuApplicationContext {
     fun <T : BukkitTask> track(task: T): T
     fun <T : AutoCloseable> track(resource: T): T
 
-    /** Runs only if this exact application session is still active. */
+    /** Runs only if this exact application session is still active, on the thread that owns the player. */
     fun execute(task: Runnable): Boolean
+
+    /**
+     * Player-scheduler tasks (Paper/Folia entity scheduler; they follow the player across regions).
+     * The returned handle supports cancel()/isCancelled(); its task id is always -1.
+     */
     fun runLater(delayTicks: Long, task: Runnable): BukkitTask
     fun runTimer(delayTicks: Long, periodTicks: Long, task: Runnable): BukkitTask
 

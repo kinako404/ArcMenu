@@ -1,5 +1,6 @@
 package com.fentai.arcmenu.paper.runtime
 
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import com.fentai.arcmenu.paper.localization.ArcMessages
 import com.fentai.arcmenu.core.behavior.*
 import com.fentai.arcmenu.paper.localization.LanguageManager
@@ -125,6 +126,10 @@ class ActionExecutor(
                         else -> listOf(player)
                     }
                     for (target in targets) {
+                        if (elsewhere(target, player)) {
+                            executeElsewhere(action, target, player, control)
+                            continue
+                        }
                         val result = executeOne(action, target, player, control)
                         if (result == ActionResult.RETURN) delayedChainStopped.set(true)
                     }
@@ -142,6 +147,10 @@ class ActionExecutor(
                 else -> listOf(player)
             }
             for (target in targets) {
+                if (elsewhere(target, player)) {
+                    executeElsewhere(action, target, player, control)
+                    continue
+                }
                 when (executeOne(action, target, player, control)) {
                     ActionResult.RETURN -> return ActionResult.RETURN
                     ActionResult.SESSION_CHANGED -> sessionChanged = true
@@ -150,6 +159,16 @@ class ActionExecutor(
             }
         }
         return if (sessionChanged) ActionResult.SESSION_CHANGED else ActionResult.CONTINUE
+    }
+
+    /** On Folia another online player may belong to a different region thread. */
+    private fun elsewhere(target: Player, source: Player): Boolean = target !== source && !ArcScheduler.owns(target)
+
+    /** Runs a broadcast action on the target's own thread; its result cannot stop the source chain. */
+    private fun executeElsewhere(action: MenuAction, target: Player, source: Player, control: RuntimeControl) {
+        ArcScheduler.execute(plugin, target, Runnable {
+            if (target.isOnline) executeOne(action, target, source, control)
+        })
     }
 
     private fun executeOne(action: MenuAction, player: Player, placeholderPlayer: Player, control: RuntimeControl): ActionResult = try {
@@ -175,7 +194,12 @@ class ActionExecutor(
                 ActionResult.CONTINUE
             }
             is ConsoleCommandAction -> {
-                expand(action.command).split(';').forEach { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), it.trim().removePrefix("/")) }
+                expand(action.command).split(';').forEach { command ->
+                    // Folia only accepts console commands on the global region thread.
+                    ArcScheduler.global(plugin, Runnable {
+                        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command.trim().removePrefix("/"))
+                    })
+                }
                 ActionResult.CONTINUE
             }
             is OpCommandAction -> {
@@ -368,7 +392,7 @@ class ActionExecutor(
         val stay = parts.getOrNull(3)?.toLongOrNull()?.coerceAtLeast(1L) ?: 15L
         val bar = BossBar.bossBar(legacy(parts.getOrElse(0) { "" }), 1f, color, overlay)
         player.showBossBar(bar)
-        Bukkit.getScheduler().runTaskLater(plugin, Runnable { if (player.isOnline) player.hideBossBar(bar) }, stay)
+        ArcScheduler.later(plugin, player, Runnable { if (player.isOnline) player.hideBossBar(bar) }, stay)
     }
 
     private fun quotedWords(source: String, limit: Int): List<String> {

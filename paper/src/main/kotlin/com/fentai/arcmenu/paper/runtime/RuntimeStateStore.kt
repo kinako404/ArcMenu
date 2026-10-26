@@ -4,7 +4,8 @@ import com.fentai.arcmenu.core.behavior.StateScope
 import com.fentai.arcmenu.paper.localization.LanguageManager
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
-import org.bukkit.scheduler.BukkitTask
+import com.fentai.arcmenu.paper.platform.ArcScheduler
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -12,23 +13,29 @@ import java.util.Base64
 import java.util.Properties
 import java.util.UUID
 
-/** TrMenu-style meta/data/global-data storage without taking a dependency on TrMenu. */
+/**
+ * TrMenu-style meta/data/global-data storage without taking a dependency on TrMenu.
+ * Synchronized because Folia menus of different players run on different region threads.
+ */
 class RuntimeStateStore(private val plugin: Plugin, private val language: LanguageManager) : AutoCloseable {
     private val meta = mutableMapOf<UUID, MutableMap<String, String>>()
     private val data = mutableMapOf<UUID, MutableMap<String, String>>()
     private val global = mutableMapOf<String, String>()
     private val arguments = mutableMapOf<UUID, List<String>>()
     private val file = plugin.dataFolder.toPath().resolve("data.properties")
-    private var pendingSave: BukkitTask? = null
+    private var pendingSave: ScheduledTask? = null
+    private val saveLock = Any()
 
     init { load() }
 
+    @Synchronized
     fun get(player: Player, scope: StateScope, key: String): String? = when (scope) {
         StateScope.META -> meta[player.uniqueId]?.get(key)
         StateScope.DATA -> data[player.uniqueId]?.get(key)
         StateScope.GLOBAL -> global[key]
     }
 
+    @Synchronized
     fun set(player: Player, scope: StateScope, key: String, value: String) {
         when (scope) {
             StateScope.META -> meta.computeIfAbsent(player.uniqueId) { mutableMapOf() }[key] = value
@@ -38,6 +45,7 @@ class RuntimeStateStore(private val plugin: Plugin, private val language: Langua
         if (scope != StateScope.META) requestSave()
     }
 
+    @Synchronized
     fun remove(player: Player, scope: StateScope, pattern: Regex) {
         val target = when (scope) {
             StateScope.META -> meta[player.uniqueId]
@@ -48,14 +56,17 @@ class RuntimeStateStore(private val plugin: Plugin, private val language: Langua
         if (scope != StateScope.META) requestSave()
     }
 
+    @Synchronized
     fun arguments(player: Player): List<String> = arguments[player.uniqueId].orEmpty().toList()
+    @Synchronized
     fun setArguments(player: Player, values: List<String>) { arguments[player.uniqueId] = values.toList() }
+    @Synchronized
     fun clearArguments(player: Player) { arguments.remove(player.uniqueId) }
 
     private fun requestSave() {
         if (pendingSave != null) return
-        pendingSave = plugin.server.scheduler.runTaskLater(plugin, Runnable {
-            pendingSave = null
+        pendingSave = ArcScheduler.asyncLater(plugin, Runnable {
+            synchronized(this) { pendingSave = null }
             save()
         }, 20L)
     }
@@ -80,12 +91,14 @@ class RuntimeStateStore(private val plugin: Plugin, private val language: Langua
         }
     }
 
-    private fun save() {
+    private fun save() = synchronized(saveLock) {
         try {
             Files.createDirectories(file.parent)
             val properties = Properties()
-            global.forEach { (key, value) -> properties["g.${encode(key)}"] = value }
-            data.forEach { (uuid, values) -> values.forEach { (key, value) -> properties["p.$uuid.${encode(key)}"] = value } }
+            synchronized(this) {
+                global.forEach { (key, value) -> properties["g.${encode(key)}"] = value }
+                data.forEach { (uuid, values) -> values.forEach { (key, value) -> properties["p.$uuid.${encode(key)}"] = value } }
+            }
             val temporary = file.resolveSibling("${file.fileName}.tmp")
             Files.newBufferedWriter(temporary, StandardCharsets.UTF_8).use { properties.store(it, "ArcMenu persistent data") }
             try {
@@ -99,11 +112,15 @@ class RuntimeStateStore(private val plugin: Plugin, private val language: Langua
     }
 
     override fun close() {
-        pendingSave?.cancel()
-        pendingSave = null
+        synchronized(this) {
+            pendingSave?.cancel()
+            pendingSave = null
+        }
         save()
-        meta.clear()
-        arguments.clear()
+        synchronized(this) {
+            meta.clear()
+            arguments.clear()
+        }
     }
 
     private fun encode(value: String) = Base64.getUrlEncoder().withoutPadding().encodeToString(value.toByteArray(StandardCharsets.UTF_8))

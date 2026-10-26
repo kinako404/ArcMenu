@@ -3,7 +3,10 @@ package com.fentai.arcmenu.api
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
 
-/** Public Java API published through Bukkit's ServicesManager. All methods run on the server thread. */
+/**
+ * Public Java API published through Bukkit's ServicesManager. Methods taking a Player must run on the thread
+ * that owns that player (Paper: main thread; Folia: the player's region thread); registration methods are thread-safe.
+ */
 interface ArcMenuApi {
     fun apiVersion(): Int
     fun capabilities(): Set<ArcMenuCapability>

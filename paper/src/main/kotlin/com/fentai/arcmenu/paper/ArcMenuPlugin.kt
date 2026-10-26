@@ -18,6 +18,7 @@ import com.fentai.arcmenu.paper.branding.StartupBanner
 import com.fentai.arcmenu.paper.localization.ArcMessages
 import com.fentai.arcmenu.paper.localization.LanguageManager
 import com.fentai.arcmenu.paper.performance.PerformanceMetrics
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import com.fentai.arcmenu.paper.editor.EditorService
 import com.fentai.arcmenu.paper.render.BukkitMenuRenderer
 import com.fentai.arcmenu.paper.render.MenuViewMode
@@ -464,7 +465,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         event.isCancelled = true
         val player = event.player
         val message = event.message
-        server.scheduler.runTask(this, Runnable { sessions.acceptChat(player, message) })
+        ArcScheduler.execute(this, player, Runnable { sessions.acceptChat(player, message) })
     }
 
     @EventHandler fun onQuit(event: PlayerQuitEvent) {
@@ -476,12 +477,15 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     fun onTeleport(event: PlayerTeleportEvent) {
         if (!sessions.isRuntime(event.player)) return
-        server.scheduler.runTask(this, Runnable { sessions.reanchorRuntime(event.player) })
+        val player = event.player
+        // The entity scheduler follows the player, so on Folia this runs in the destination region.
+        ArcScheduler.later(this, player, Runnable { sessions.reanchorRuntime(player) }, 1L)
     }
     @EventHandler(priority = EventPriority.MONITOR)
     fun onRespawn(event: PlayerRespawnEvent) {
         if (!sessions.isRuntime(event.player)) return
-        server.scheduler.runTask(this, Runnable { sessions.reanchorRuntime(event.player) })
+        val player = event.player
+        ArcScheduler.later(this, player, Runnable { sessions.reanchorRuntime(player) }, 1L)
     }
 
     @EventHandler fun onPluginDisable(event: PluginDisableEvent) {

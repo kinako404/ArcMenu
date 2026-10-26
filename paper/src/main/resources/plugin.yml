@@ -2,6 +2,7 @@ name: ArcMenu
 version: '${project.version}'
 main: com.fentai.arcmenu.paper.ArcMenuPlugin
 api-version: '1.21'
+folia-supported: true
 description: ArcMenu display-menu runtime and server-authoritative Fabric editor bridge
 website: https://github.com/FENTAIIII/ArcMenu
 depend: [ProtocolLib]

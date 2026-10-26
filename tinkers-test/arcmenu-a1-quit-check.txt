@@ -1,0 +1,19 @@
+# ArcMenu A1：接在 arcmenu-a1-touch.txt 之后跑（上一场景开着菜单直接断线）。
+# 菜单实体是只给本人看的（visibleByDefault=false），重连后客户端看不到残留，所以用服务端选择器数 2600,250,2600 周围的展示实体。
+connect
+respawn
+wait 60
+cmd execute in minecraft:overworld run tp @s 2600.5 250 2600.5 0 0
+wait 20
+cmd execute if entity @e[type=minecraft:text_display,distance=..16]
+wait 5
+dump after_quit_text
+expect Test failed
+cmd execute if entity @e[type=minecraft:interaction,distance=..16]
+wait 5
+dump after_quit_interaction
+expect Test failed
+cmd arcmenu status
+wait 5
+dump status_after_quit
+screenshot arcmenu_a1_after_quit
