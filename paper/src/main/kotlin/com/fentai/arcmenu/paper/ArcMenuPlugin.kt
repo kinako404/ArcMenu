@@ -78,7 +78,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     private lateinit var language: LanguageManager
     private var usageMetrics: Metrics? = null
     private lateinit var menuCommands: MenuCommandRegistry
-    private var shortcutSettings = MenuShortcutSettings()
+    @Volatile private var shortcutSettings = MenuShortcutSettings()
     private var initialCatalogPending = false
     private val menuDirectory get() = dataFolder.toPath().resolve("menus")
     private val templateDirectory get() = dataFolder.toPath().resolve("templates")
@@ -90,7 +90,8 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         shortcutSettings = MenuShortcutSettingsLoader.load(this)
         language = LanguageManager(this).also(LanguageManager::load)
         menuCommands = MenuCommandRegistry(this, language) { player, menuId, arguments ->
-            sessions.openRoot(player, menuId, arguments)
+            onPlayerThread(player) { sessions.openRoot(player, menuId, arguments) }
+            true
         }
         server.messenger.registerOutgoingPluginChannel(this, "BungeeCord")
         BundledMenuDefaults.install(this)
@@ -102,7 +103,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
             logger.severe(language.log("log.resource-initial-failed", error.message.orEmpty()))
         }
         craftEngine = CraftEngineBridge(this, resources, language, this::onCraftEngineReloadReady).also(CraftEngineBridge::start)
-        performance = PerformanceMetrics()
+        performance = PerformanceMetrics { server.currentTick.toLong() }
         renderer = BukkitMenuRenderer(this, resources, craftEngine, performance)
         state = RuntimeStateStore(this, language)
         val placeholders = PlaceholderResolver(this, state, language)
@@ -180,6 +181,12 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     }
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
+        if (sender is Player && !ArcScheduler.owns(sender)) {
+            // `execute as <player> run arcmenu …` runs on the global or another region's thread on Folia.
+            val arguments = args.copyOf()
+            onPlayerThread(sender) { onCommand(sender, command, label, arguments) }
+            return true
+        }
         val subcommand = args.firstOrNull()?.lowercase()
         if (subcommand == "open") {
             val player = sender as? Player ?: run { reply(sender, "command.open.player-only"); return true }
@@ -472,6 +479,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         if (::workspace.isInitialized) workspace.disconnect(event.player)
         if (::editor.isInitialized) editor.close(event.player)
         sessions.closeImmediately(event.player, true)
+        sessions.forget(event.player)
         if (::pointer.isInitialized) pointer.discard(event.player)
     }
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -486,6 +494,11 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         if (!sessions.isRuntime(event.player)) return
         val player = event.player
         ArcScheduler.later(this, player, Runnable { sessions.reanchorRuntime(player) }, 1L)
+    }
+
+    /** Runs player-facing work on the thread that owns [player]; inline when already there. */
+    private fun onPlayerThread(player: Player, task: () -> Unit) {
+        ArcScheduler.execute(this, player, Runnable { if (player.isOnline) task() })
     }
 
     @EventHandler fun onPluginDisable(event: PluginDisableEvent) {

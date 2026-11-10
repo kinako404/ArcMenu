@@ -16,9 +16,9 @@ class PlaceholderResolver(
     private val function = Regex("\\{(meta|m|data|d|globaldata|gdata|g):\\s*([^{}]+)}", RegexOption.IGNORE_CASE)
     private val argument = Regex("\\{([0-9]+)}")
     private val named = Regex("%arcmenu_(meta|data|globaldata|args)_(.+?)%", RegexOption.IGNORE_CASE)
-    private var attemptedPlaceholderApi = false
-    private var placeholderMethod: Method? = null
-    private var placeholderWarningSent = false
+    @Volatile private var attemptedPlaceholderApi = false
+    @Volatile private var placeholderMethod: Method? = null
+    @Volatile private var placeholderWarningSent = false
 
     fun expand(player: Player, source: String): String {
         var value = function.replace(source) { match ->
@@ -62,16 +62,20 @@ class PlaceholderResolver(
 
     private fun placeholderApi(): Method? {
         if (attemptedPlaceholderApi) return placeholderMethod
-        attemptedPlaceholderApi = true
-        if (!plugin.server.pluginManager.isPluginEnabled("PlaceholderAPI")) return null
-        placeholderMethod = try {
+        if (!plugin.server.pluginManager.isPluginEnabled("PlaceholderAPI")) {
+            attemptedPlaceholderApi = true
+            return null
+        }
+        val method = try {
             Class.forName("me.clip.placeholderapi.PlaceholderAPI")
                 .getMethod("setPlaceholders", Player::class.java, String::class.java)
         } catch (error: ReflectiveOperationException) {
-            plugin.logger.warning(language.log("log.placeholder-connect-failed", error.message.orEmpty()))
+            if (!attemptedPlaceholderApi) plugin.logger.warning(language.log("log.placeholder-connect-failed", error.message.orEmpty()))
             null
         }
-        return placeholderMethod
+        placeholderMethod = method
+        attemptedPlaceholderApi = true
+        return method
     }
 
     private fun number(value: Double): String = String.format(Locale.ROOT, "%.2f", value)

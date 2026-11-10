@@ -106,6 +106,8 @@ class PointerController(
         var restoreYaw: Float,
         var restorePitch: Float,
         var camera: TextDisplay,
+        var cameraId: Int,
+        var cameraPending: Boolean = false,
         var recentring: Boolean = false,
         val activation: CameraActivationGate = CameraActivationGate(),
         val exit: CameraActivationGate = CameraActivationGate(),
@@ -167,7 +169,7 @@ class PointerController(
                 MenuPoint(0.0, 0.0), plane.canvas,
                 player.location.yaw, 0.0f,
                 player.location.yaw, 0.0f,
-                camera,
+                camera, camera.entityId,
             )
             cursors[player.uniqueId] = state
             try {
@@ -175,7 +177,7 @@ class PointerController(
                 // The camera target must be active before the client-only spectator mode is
                 // applied. Otherwise the client can render one spectator frame from the
                 // player's body and expose underground geometry.
-                packets.setCamera(player, camera)
+                packets.setCamera(player, state.cameraId)
                 packets.hideFirstPersonHands(player)
                 packets.resetClientRotation(player, state.restoreYaw, state.restorePitch) { id ->
                     state.activation.expect(id)
@@ -186,40 +188,46 @@ class PointerController(
                 throw error
             }
         } else {
-            val resumeEnding = synchronized(existing) {
+            val (resumeEnding, camera, cameraId) = synchronized(existing) {
                 existing.canvas = plane.canvas
                 existing.point = clamp(existing.point, plane.canvas)
                 val ending = existing.ending
                 existing.ending = false
-                ending
+                Triple(ending, existing.camera, existing.cameraId)
             }
-            if (resumeEnding) {
+            val misplaced = !camera.isValid || camera.world.uid != player.world.uid || !ArcScheduler.owns(camera)
+            if (resumeEnding && !misplaced) {
                 // A new menu opened before the acknowledged exit finished. The old exit
                 // packets precede these packets on the same connection, so reasserting the
                 // existing camera creates one fresh, ordered activation transaction.
-                packets.setCamera(player, existing.camera)
+                packets.setCamera(player, cameraId)
                 packets.hideFirstPersonHands(player)
                 packets.resetClientRotation(player, existing.restoreYaw, existing.restorePitch) { id ->
                     existing.activation.expect(id)
                 }
-            } else if (!existing.camera.isValid || existing.camera.world.uid != player.world.uid) {
+            } else if (misplaced) {
                 reanchor(player, plane)
             }
         }
         return mode
     }
 
-    /** Rebuilds only camera state and preserves the cursor point across respawn/world relocation. */
+    /**
+     * Rebuilds only camera state and preserves the cursor point across respawn/world relocation.
+     * Right after a far teleport the destination chunk may not have reached the client yet, and a
+     * camera packet for an entity the client does not know is ignored; the switch then waits in
+     * [poll] until the player tracks the new camera.
+     */
     fun reanchor(player: Player, plane: MenuPlane) {
         check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程重建" }
         val state = cursors[player.uniqueId] ?: return
         val replacement = spawnCamera(player, plane)
+        val replacementId = replacement.entityId
         player.showEntity(plugin, replacement)
         val centreYaw = player.location.yaw
+        val tracked = player in replacement.trackedBy
         try {
-            packets.setCamera(player, replacement)
-            packets.hideFirstPersonHands(player)
-            packets.resetClientRotation(player, centreYaw, 0.0f)
+            if (tracked) switchCamera(player, replacementId, centreYaw)
         } catch (error: Throwable) {
             ArcScheduler.remove(plugin, replacement)
             throw error
@@ -227,6 +235,8 @@ class PointerController(
         val previous = synchronized(state) {
             val old = state.camera
             state.camera = replacement
+            state.cameraId = replacementId
+            state.cameraPending = !tracked
             state.canvas = plane.canvas
             state.point = clamp(state.point, plane.canvas)
             state.lastYaw = centreYaw
@@ -240,10 +250,10 @@ class PointerController(
     }
 
     fun end(player: Player) {
+        check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程移除" }
         activeInputs.remove(player.uniqueId)
         suspendedInputs.remove(player.uniqueId)
         menuInput.state(player, false)
-        check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程移除" }
         val state = cursors[player.uniqueId] ?: return
         val alreadyEnding = synchronized(state) {
             val previous = state.ending
@@ -279,6 +289,8 @@ class PointerController(
     fun discard(player: Player) {
         activeInputs.remove(player.uniqueId)
         suspendedInputs.remove(player.uniqueId)
+        menuInput.forget(player)
+        packets.forget(player)
         val state = cursors.remove(player.uniqueId) ?: return
         ArcScheduler.remove(plugin, state.camera)
     }
@@ -287,7 +299,7 @@ class PointerController(
         check(ArcScheduler.mayTouch(player)) { "摄像机只能在玩家所属的区域线程交还" }
         if (!cursors.remove(player.uniqueId, expected)) return
         try {
-            if (player.isOnline) packets.setCamera(player, player)
+            if (player.isOnline) packets.setCamera(player, player.entityId)
         } catch (error: Throwable) {
             plugin.logger.warning("无法在鼠标模式退出时交还 ${player.name} 的摄像机: ${error.message.orEmpty()}")
         } finally {
@@ -301,7 +313,7 @@ class PointerController(
             if (player.isOnline) {
                 runCatching { packets.synchronizeClientPlayer(player) }
                 runCatching { packets.restoreClientGameMode(player) }
-                runCatching { packets.setCamera(player, player) }
+                runCatching { packets.setCamera(player, player.entityId) }
             }
         } finally {
             ArcScheduler.remove(plugin, expected.camera)
@@ -310,7 +322,8 @@ class PointerController(
 
     fun hasValidCamera(player: Player): Boolean {
         val state = cursors[player.uniqueId] ?: return false
-        return synchronized(state) { state.camera.isValid && state.camera.world.uid == player.world.uid }
+        val camera = synchronized(state) { state.camera }
+        return camera.isValid && camera.world.uid == player.world.uid && ArcScheduler.owns(camera)
     }
 
     /** True after the client acknowledges the ordered camera activation packet sequence. */
@@ -347,7 +360,20 @@ class PointerController(
     }
 
     fun poll(player: Player) {
-        if (player.uniqueId !in suspendedInputs && cursors.containsKey(player.uniqueId)) packets.requestRotationSample(player)
+        val state = cursors[player.uniqueId] ?: return
+        val pending = synchronized(state) { if (state.cameraPending) state.camera to state.restoreYaw else null }
+        if (pending != null) {
+            if (player !in pending.first.trackedBy) return
+            synchronized(state) { state.cameraPending = false }
+            switchCamera(player, synchronized(state) { state.cameraId }, pending.second)
+        }
+        if (player.uniqueId !in suspendedInputs) packets.requestRotationSample(player)
+    }
+
+    private fun switchCamera(player: Player, cameraId: Int, centreYaw: Float) {
+        packets.setCamera(player, cameraId)
+        packets.hideFirstPersonHands(player)
+        packets.resetClientRotation(player, centreYaw, 0.0f)
     }
 
     private fun consumeRotation(player: Player, yaw: Float, pitch: Float): Boolean {
@@ -386,7 +412,7 @@ class PointerController(
     private fun consumeInput(player: Player, button: PointerButton): Boolean {
         if (player.uniqueId !in activeInputs) return false
         if (player.uniqueId in suspendedInputs) return true
-        if (menuInput.available(player)) return true
+        if (menuInput.listening(player)) return true
         ArcScheduler.execute(plugin, player, Runnable {
             if (player.uniqueId in activeInputs && player.uniqueId !in suspendedInputs) activated(player, button, player.isSneaking)
         })

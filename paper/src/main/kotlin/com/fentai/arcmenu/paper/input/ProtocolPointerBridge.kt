@@ -8,9 +8,9 @@ import com.comphenix.protocol.events.ListenerPriority
 import com.comphenix.protocol.events.PacketAdapter
 import com.comphenix.protocol.events.PacketContainer
 import com.comphenix.protocol.events.PacketEvent
+import com.comphenix.protocol.injector.PacketConstructor
 import org.bukkit.GameMode
 import org.bukkit.Location
-import org.bukkit.entity.Entity
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
 import java.lang.reflect.Constructor
@@ -33,8 +33,8 @@ internal class ProtocolPointerBridge(
 ) : AutoCloseable {
     private val manager = ProtocolLibrary.getProtocolManager()
     private val nextSyntheticTeleportId = AtomicInteger(-1)
-    private val syntheticTeleportIds = ConcurrentHashMap<UUID, MutableSet<Int>>()
-    private val syntheticResponses = ConcurrentHashMap<UUID, AtomicInteger>()
+    private val synthetic = SyntheticTeleportLedger()
+    @Volatile private var cameraPackets: PacketConstructor? = null
     private val positionPackets by lazy { SyntheticPositionPacketFactory(PacketType.Play.Server.POSITION.packetClass) }
     private val gameModePackets by lazy { ClientGameModePacketFactory(PacketType.Play.Server.GAME_STATE_CHANGE.packetClass) }
     private val middlePacketTypes = PacketType.values().filter { type ->
@@ -93,12 +93,15 @@ internal class ProtocolPointerBridge(
     }
 
     /**
-     * The camera packet has no no-argument constructor. Let ProtocolLib unwrap the Bukkit entity
-     * and invoke ClientboundSetCameraPacket(Entity) instead of creating an empty packet first.
+     * ClientboundSetCameraPacket has no no-argument constructor (ProtocolLib cannot create it empty).
+     * Build it from the receiving player, who is always owned by the calling thread, then write the
+     * target's cached id, so a camera in another Folia region is never unwrapped off its thread.
      */
-    fun setCamera(player: Player, target: Entity) {
-        val constructor = manager.createPacketConstructor(PacketType.Play.Server.CAMERA, target)
-        val packet = constructor.createPacket(target)
+    fun setCamera(player: Player, targetId: Int) {
+        val constructor = cameraPackets ?: manager.createPacketConstructor(PacketType.Play.Server.CAMERA, player)
+            .also { cameraPackets = it }
+        val packet = constructor.createPacket(player)
+        packet.integers.write(0, targetId)
         manager.sendServerPacket(player, packet, false)
     }
 
@@ -114,8 +117,9 @@ internal class ProtocolPointerBridge(
 
     /**
      * An external camera makes vanilla LocalPlayer.sendPosition() stop sending natural LOOK packets.
-     * A zero relative position sync asks the client for an immediate PosRot reply without moving its
-     * player or camera. Its negative teleport id and reply are consumed by this bridge.
+     * A zero relative position sync makes the client report its hidden rotation without moving its
+     * player or camera: up to 26.2 as an id-only accept plus a PosRot reply, from 26.3 inside the
+     * accept itself. Its negative teleport id and any reply are consumed by this bridge.
      */
     fun requestRotationSample(player: Player) {
         sendSyntheticPosition(player, null, null)
@@ -143,22 +147,19 @@ internal class ProtocolPointerBridge(
     private fun consumeSyntheticTeleport(event: PacketEvent): Boolean {
         val integers = event.packet.integers
         if (integers.size() < 1) return false
-        val ids = syntheticTeleportIds[event.player.uniqueId] ?: return false
         val id = integers.read(0)
-        if (!ids.remove(id)) return false
-        syntheticResponses.computeIfAbsent(event.player.uniqueId) { AtomicInteger() }.incrementAndGet()
+        val floats = event.packet.float
+        val rotationInAccept = floats.size() >= 2
+        if (!synthetic.accept(event.player.uniqueId, id, rotationInAccept)) return false
+        if (rotationInAccept) rotation(event.player, floats.read(0), floats.read(1))
         syntheticTeleportAccepted(event.player, id)
         return true
     }
 
-    private fun claimSyntheticResponse(player: Player): Boolean {
-        val counter = syntheticResponses[player.uniqueId] ?: return false
-        while (true) {
-            val value = counter.get()
-            if (value <= 0) return false
-            if (counter.compareAndSet(value, value - 1)) return true
-        }
-    }
+    private fun claimSyntheticResponse(player: Player): Boolean = synthetic.claimResponse(player.uniqueId)
+
+    /** Drops a disconnected player's pending ids and reply credit. */
+    fun forget(player: Player) = synthetic.forget(player.uniqueId)
 
     private fun consumeHandInput(event: PacketEvent, button: PointerButton): Boolean {
         val hand = event.packet.hands.readSafely(0)
@@ -186,7 +187,7 @@ internal class ProtocolPointerBridge(
         beforeSend: (Int) -> Unit = {},
         absolutePosition: Location? = null,
     ): Int? {
-        val ids = syntheticTeleportIds.computeIfAbsent(player.uniqueId) { ConcurrentHashMap.newKeySet() }
+        val ids = synthetic.pending(player.uniqueId)
         // A non-responsive client must not create an unbounded pending-id collection.
         // Explicit reset/restore packets still have to pass so cleanup cannot leave a stale view.
         if (yaw == null && ids.size >= MAX_PENDING_TELEPORTS) return null
@@ -212,12 +213,45 @@ internal class ProtocolPointerBridge(
 
     override fun close() {
         manager.removePacketListener(listener)
-        syntheticTeleportIds.clear()
-        syntheticResponses.clear()
+        synthetic.clear()
     }
 
     private companion object {
         const val MAX_PENDING_TELEPORTS = 128
+    }
+}
+
+/** Pending ArcMenu position-sync ids per player, and how many legacy PosRot replies they still owe. */
+internal class SyntheticTeleportLedger {
+    private val ids = ConcurrentHashMap<UUID, MutableSet<Int>>()
+    private val responses = ConcurrentHashMap<UUID, AtomicInteger>()
+
+    fun pending(player: UUID): MutableSet<Int> = ids.computeIfAbsent(player) { ConcurrentHashMap.newKeySet() }
+
+    /** True when [id] was ArcMenu's. Only an accept without rotation is followed by a PosRot reply. */
+    fun accept(player: UUID, id: Int, rotationInAccept: Boolean): Boolean {
+        if (ids[player]?.remove(id) != true) return false
+        if (!rotationInAccept) responses.computeIfAbsent(player) { AtomicInteger() }.incrementAndGet()
+        return true
+    }
+
+    fun claimResponse(player: UUID): Boolean {
+        val counter = responses[player] ?: return false
+        while (true) {
+            val value = counter.get()
+            if (value <= 0) return false
+            if (counter.compareAndSet(value, value - 1)) return true
+        }
+    }
+
+    fun forget(player: UUID) {
+        ids.remove(player)
+        responses.remove(player)
+    }
+
+    fun clear() {
+        ids.clear()
+        responses.clear()
     }
 }
 
