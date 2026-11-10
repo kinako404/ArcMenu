@@ -8,9 +8,9 @@ import com.comphenix.protocol.events.ListenerPriority
 import com.comphenix.protocol.events.PacketAdapter
 import com.comphenix.protocol.events.PacketContainer
 import com.comphenix.protocol.events.PacketEvent
+import com.comphenix.protocol.injector.PacketConstructor
 import org.bukkit.GameMode
 import org.bukkit.Location
-import org.bukkit.entity.Entity
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
 import java.lang.reflect.Constructor
@@ -34,6 +34,7 @@ internal class ProtocolPointerBridge(
     private val manager = ProtocolLibrary.getProtocolManager()
     private val nextSyntheticTeleportId = AtomicInteger(-1)
     private val synthetic = SyntheticTeleportLedger()
+    @Volatile private var cameraPackets: PacketConstructor? = null
     private val positionPackets by lazy { SyntheticPositionPacketFactory(PacketType.Play.Server.POSITION.packetClass) }
     private val gameModePackets by lazy { ClientGameModePacketFactory(PacketType.Play.Server.GAME_STATE_CHANGE.packetClass) }
     private val middlePacketTypes = PacketType.values().filter { type ->
@@ -92,16 +93,15 @@ internal class ProtocolPointerBridge(
     }
 
     /**
-     * Builds ClientboundSetCameraPacket from a cached entity id, so a camera left in another Folia
-     * region is never unwrapped off its owning thread. The Entity constructor remains the fallback
-     * for ProtocolLib builds that cannot instantiate the packet without arguments.
+     * ClientboundSetCameraPacket has no no-argument constructor (ProtocolLib cannot create it empty).
+     * Build it from the receiving player, who is always owned by the calling thread, then write the
+     * target's cached id, so a camera in another Folia region is never unwrapped off its thread.
      */
-    fun setCamera(player: Player, target: Entity, targetId: Int) {
-        val packet = runCatching {
-            PacketContainer(PacketType.Play.Server.CAMERA).also { it.integers.write(0, targetId) }
-        }.getOrElse {
-            manager.createPacketConstructor(PacketType.Play.Server.CAMERA, target).createPacket(target)
-        }
+    fun setCamera(player: Player, targetId: Int) {
+        val constructor = cameraPackets ?: manager.createPacketConstructor(PacketType.Play.Server.CAMERA, player)
+            .also { cameraPackets = it }
+        val packet = constructor.createPacket(player)
+        packet.integers.write(0, targetId)
         manager.sendServerPacket(player, packet, false)
     }
 

@@ -176,7 +176,7 @@ class PointerController(
                 // The camera target must be active before the client-only spectator mode is
                 // applied. Otherwise the client can render one spectator frame from the
                 // player's body and expose underground geometry.
-                packets.setCamera(player, camera, state.cameraId)
+                packets.setCamera(player, state.cameraId)
                 packets.hideFirstPersonHands(player)
                 packets.resetClientRotation(player, state.restoreYaw, state.restorePitch) { id ->
                     state.activation.expect(id)
@@ -199,7 +199,7 @@ class PointerController(
                 // A new menu opened before the acknowledged exit finished. The old exit
                 // packets precede these packets on the same connection, so reasserting the
                 // existing camera creates one fresh, ordered activation transaction.
-                packets.setCamera(player, camera, cameraId)
+                packets.setCamera(player, cameraId)
                 packets.hideFirstPersonHands(player)
                 packets.resetClientRotation(player, existing.restoreYaw, existing.restorePitch) { id ->
                     existing.activation.expect(id)
@@ -220,7 +220,7 @@ class PointerController(
         player.showEntity(plugin, replacement)
         val centreYaw = player.location.yaw
         try {
-            packets.setCamera(player, replacement, replacementId)
+            packets.setCamera(player, replacementId)
             packets.hideFirstPersonHands(player)
             packets.resetClientRotation(player, centreYaw, 0.0f)
         } catch (error: Throwable) {
@@ -293,7 +293,7 @@ class PointerController(
         check(ArcScheduler.mayTouch(player)) { "摄像机只能在玩家所属的区域线程交还" }
         if (!cursors.remove(player.uniqueId, expected)) return
         try {
-            if (player.isOnline) packets.setCamera(player, player, player.entityId)
+            if (player.isOnline) packets.setCamera(player, player.entityId)
         } catch (error: Throwable) {
             plugin.logger.warning("无法在鼠标模式退出时交还 ${player.name} 的摄像机: ${error.message.orEmpty()}")
         } finally {
@@ -307,7 +307,7 @@ class PointerController(
             if (player.isOnline) {
                 runCatching { packets.synchronizeClientPlayer(player) }
                 runCatching { packets.restoreClientGameMode(player) }
-                runCatching { packets.setCamera(player, player, player.entityId) }
+                runCatching { packets.setCamera(player, player.entityId) }
             }
         } finally {
             ArcScheduler.remove(plugin, expected.camera)
