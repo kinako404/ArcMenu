@@ -113,6 +113,25 @@ actions:
 
 See the [Java addon example](examples/java-addon/src/main/java/example/ExampleArcMenuAddon.java).
 
+### Threading contract
+
+This fork advertises `ArcMenuCapability.REGION_THREADING` in `capabilities()` (`apiVersion()` stays 1):
+
+- **Any thread**: `apiVersion`, `capabilities`, `applications`, `pointerPolicy`, route and application (un)registration, `close(player)`, `runFor`, `openAsync`, `openApplicationAsync`, and every `ArcMenuApplicationHandle` method.
+- **Owning thread of the player** (Paper: the main thread; Folia: the region thread that currently owns the player): every other method taking a `Player`, such as `open` and `openApplication`. Elsewhere they throw `IllegalStateException`; use `runFor(player, api -> …)` or the `*Async` variants (`CompletableFuture<Boolean>`, completed with `false` when the player is offline or ArcMenu is disabled).
+- **Callbacks** (routes, `ArcMenuApplication.open`, session callbacks) run on the owning thread of their player and follow the player across regions. One player's callbacks are serial; on Folia different players' callbacks run concurrently, so state shared between sessions must be thread-safe.
+- `ArcMenuApplicationContext`: `isActive`, `execute` and `track` may be called from any thread, everything else on the player's thread. `spawnPrivate` needs a location inside the player's current region. `runLater` / `runTimer` return a handle whose task id is always -1; for a real handle schedule on `player.getScheduler()` and pass the `ScheduledTask` to `track(task)` so it is cancelled with the session.
+
+```java
+if (arcMenu.capabilities().contains(ArcMenuCapability.REGION_THREADING)) {
+    arcMenu.openApplicationAsync(player, "myplugin:shop");          // from any thread
+} else {
+    player.getScheduler().run(plugin, task -> arcMenu.openApplication(player, "myplugin:shop"), null);
+}
+```
+
+Details (in Chinese): [docs/folia/README.md](docs/folia/README.md#公开-api-的线程契约).
+
 ## Build from source
 
 ArcMenu is a Maven multi-module project. The default build targets Paper 1.21.1 and Java 21:

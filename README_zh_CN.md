@@ -109,6 +109,25 @@ actions:
 
 最小接入代码见 [Java 附属示例](examples/java-addon/src/main/java/example/ExampleArcMenuAddon.java)。
 
+### 线程契约
+
+本 fork 在 `capabilities()` 里声明 `ArcMenuCapability.REGION_THREADING`（`apiVersion()` 仍为 1）：
+
+- **任意线程可调**：`apiVersion`、`capabilities`、`applications`、`pointerPolicy`、路由与应用的注册 / 注销、`close(player)`、`runFor`、`openAsync`、`openApplicationAsync`，以及 `ArcMenuApplicationHandle` 的所有方法。
+- **必须在玩家的所属线程调用**（Paper：主线程；Folia：当前拥有该玩家的区域线程）：其余所有带 `Player` 参数的方法，例如 `open`、`openApplication`。在别的线程调用会抛 `IllegalStateException`；请改用 `runFor(player, api -> …)` 或 `*Async` 版本（返回 `CompletableFuture<Boolean>`，玩家已下线或 ArcMenu 已停用时以 `false` 完成）。
+- **回调**（路由、`ArcMenuApplication.open`、会话回调）在其玩家的所属线程上执行，并随玩家跨区域。同一玩家的回调串行；Folia 上不同玩家的回调会并发执行，会话之间共享的状态需要自己保证线程安全。
+- `ArcMenuApplicationContext`：`isActive`、`execute`、`track` 可在任意线程调用，其余只能在玩家线程调用；`spawnPrivate` 的位置必须在玩家当前所在的区域内；`runLater` / `runTimer` 返回的句柄 task id 恒为 -1，需要真实句柄时自己在 `player.getScheduler()` 上调度，再把 `ScheduledTask` 交给 `track(task)`，会话关闭时自动取消。
+
+```java
+if (arcMenu.capabilities().contains(ArcMenuCapability.REGION_THREADING)) {
+    arcMenu.openApplicationAsync(player, "myplugin:shop");          // 任意线程
+} else {
+    player.getScheduler().run(plugin, task -> arcMenu.openApplication(player, "myplugin:shop"), null);
+}
+```
+
+细节见 [docs/folia/README.md](docs/folia/README.md#公开-api-的线程契约)。
+
 ## 从源码构建
 
 ArcMenu 是 Maven 多模块项目。默认构建面向 Paper 1.21.1 与 Java 21：
