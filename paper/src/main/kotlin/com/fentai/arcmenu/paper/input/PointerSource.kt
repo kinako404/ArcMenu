@@ -107,6 +107,7 @@ class PointerController(
         var restorePitch: Float,
         var camera: TextDisplay,
         var cameraId: Int,
+        var cameraPending: Boolean = false,
         var recentring: Boolean = false,
         val activation: CameraActivationGate = CameraActivationGate(),
         val exit: CameraActivationGate = CameraActivationGate(),
@@ -211,7 +212,12 @@ class PointerController(
         return mode
     }
 
-    /** Rebuilds only camera state and preserves the cursor point across respawn/world relocation. */
+    /**
+     * Rebuilds only camera state and preserves the cursor point across respawn/world relocation.
+     * Right after a far teleport the destination chunk may not have reached the client yet, and a
+     * camera packet for an entity the client does not know is ignored; the switch then waits in
+     * [poll] until the player tracks the new camera.
+     */
     fun reanchor(player: Player, plane: MenuPlane) {
         check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程重建" }
         val state = cursors[player.uniqueId] ?: return
@@ -219,10 +225,9 @@ class PointerController(
         val replacementId = replacement.entityId
         player.showEntity(plugin, replacement)
         val centreYaw = player.location.yaw
+        val tracked = player in replacement.trackedBy
         try {
-            packets.setCamera(player, replacementId)
-            packets.hideFirstPersonHands(player)
-            packets.resetClientRotation(player, centreYaw, 0.0f)
+            if (tracked) switchCamera(player, replacementId, centreYaw)
         } catch (error: Throwable) {
             ArcScheduler.remove(plugin, replacement)
             throw error
@@ -231,6 +236,7 @@ class PointerController(
             val old = state.camera
             state.camera = replacement
             state.cameraId = replacementId
+            state.cameraPending = !tracked
             state.canvas = plane.canvas
             state.point = clamp(state.point, plane.canvas)
             state.lastYaw = centreYaw
@@ -354,7 +360,20 @@ class PointerController(
     }
 
     fun poll(player: Player) {
-        if (player.uniqueId !in suspendedInputs && cursors.containsKey(player.uniqueId)) packets.requestRotationSample(player)
+        val state = cursors[player.uniqueId] ?: return
+        val pending = synchronized(state) { if (state.cameraPending) state.camera to state.restoreYaw else null }
+        if (pending != null) {
+            if (player !in pending.first.trackedBy) return
+            synchronized(state) { state.cameraPending = false }
+            switchCamera(player, synchronized(state) { state.cameraId }, pending.second)
+        }
+        if (player.uniqueId !in suspendedInputs) packets.requestRotationSample(player)
+    }
+
+    private fun switchCamera(player: Player, cameraId: Int, centreYaw: Float) {
+        packets.setCamera(player, cameraId)
+        packets.hideFirstPersonHands(player)
+        packets.resetClientRotation(player, centreYaw, 0.0f)
     }
 
     private fun consumeRotation(player: Player, yaw: Float, pitch: Float): Boolean {
