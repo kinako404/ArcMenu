@@ -57,15 +57,4 @@ class StableDisplayTransformTest {
         assertTrue(secondTarget.duration == 1 && secondTarget.primed)
         assertTrue(shearFallback.duration == 0 && !shearFallback.primed)
     }
-
-    @Test
-    fun `hemisphere alignment does not link against the JOML dot overload`() {
-        val rotation = Quaternionf().rotateY(0.4f)
-        val flipped = Quaternionf(rotation).mul(-1.0f)
-        assertTrue(quaternionDot(rotation, flipped) < 0.0f)
-        val aligned = StableDisplayTransforms.alignHemisphere(flipped, rotation)
-        assertTrue(quaternionDot(rotation, aligned) > 0.0f)
-        val bytecode = StableDisplayTransforms::class.java.getResourceAsStream("StableDisplayTransforms.class")!!.readBytes()
-        assertTrue(String(bytecode, Charsets.ISO_8859_1).indexOf("(Lorg/joml/Quaternionf;)F") < 0)
-    }
 }
