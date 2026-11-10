@@ -56,7 +56,7 @@
 - 游戏内（`../arcmenu/scenarios/`，Folia 25611 与 Paper 25612 两服）：
   - `touch-ux-verify`（菜单 `touch-ux-test.yml`）：传送后先小转再转 22°，指针 x=-46.62 y=-24.04 正确；潜行、站起后同一视角指针不变；第一版的复现动作后指针更新到 x=-74.41；爬行（头顶放方块，眼高 0.4）y 不变；拿钻石镐指着界面后面的石头创造 / 生存连点 8 次石头还在、指着后面的盔甲架左键它还在；右键雪球没扔出、弓没射箭、石头没放、副手火把还在；左键 10 次（含 1 tick 间隔连点 5 次）全部送达、右键 11、潜行左 2、潜行右 3，数字与动作一一对应。两服都过。截图 `shots/*-touch-ux-verify/`（站立 / 潜行 / 爬行同一视角，界面在画面里的位置不变）。
   - `touch-ux-eyetrack`：上表数据。
-  - `run-regression.sh`：见 `../arcmenu/shots/regress-touchux-568c6b7/summary.txt`。
+  - `run-regression.sh`（568c6b7 的 jar，两服 × base / reload / stall / ce）：36/36 通过，JFR 下 ArcMenu 栈帧无可疑异常，日志无线程检查失败 / NoSuchMethodError / UOE / ISE（`../arcmenu/shots/regress-touchux-568c6b7/summary.txt`）。
 
 ## 遗留
 
