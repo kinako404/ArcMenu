@@ -32,6 +32,15 @@ abstract class ArcMenuApplicationSession {
     open fun onScroll(event: ArcMenuScrollEvent) = Unit
     open fun onTick(event: ArcMenuTickEvent) = Unit
     open fun onClose(event: ArcMenuApplicationCloseEvent) = Unit
+
+    /**
+     * Touch mode: the screen followed a change of the player's eye height (sneaking, standing up, swimming,
+     * crawling) and was moved rigidly by [ArcMenuSurfaceMoveEvent.offset]. Unlike [onSurfaceChanged] with
+     * `initial = false`, nothing was rebuilt: ArcMenu has already moved every tracked entity (spawnPrivate
+     * and track) by the same offset, so the canvas point under the crosshair is unchanged. Applications only
+     * need this to update cached world positions, e.g. the location they spawn new private entities at.
+     */
+    open fun onSurfaceMoved(event: ArcMenuSurfaceMoveEvent) = Unit
 }
 
 /**
@@ -159,6 +168,20 @@ enum class ArcMenuPointerButton { LEFT, RIGHT, MIDDLE }
 enum class ArcMenuApplicationCloseReason { REQUESTED, BACK, REPLACED, PLAYER_QUIT, PLUGIN_DISABLE, OWNER_DISABLED, ERROR }
 
 data class ArcMenuSurfaceEvent(val surface: ArcMenuSurface, val initial: Boolean)
+/**
+ * [surface] is the moved screen and [offset] the world-space move (blocks). Display entities interpolate the
+ * move over [durationTicks] when their teleport duration already equals it; ArcMenu sets that duration on
+ * entities that had another one and moves those one tick later (spawn displays with
+ * `setTeleportDuration(durationTicks)`, see [ArcMenuSurfaceMoveEvent.DEFAULT_DURATION_TICKS], to avoid the lag).
+ */
+class ArcMenuSurfaceMoveEvent(val surface: ArcMenuSurface, offset: Vector, val durationTicks: Int) {
+    private val offsetValue = offset.clone()
+    fun offset(): Vector = offsetValue.clone()
+
+    companion object {
+        const val DEFAULT_DURATION_TICKS: Int = 2
+    }
+}
 data class ArcMenuPointerModeEvent(val previous: ArcMenuPointerMode, val current: ArcMenuPointerMode)
 data class ArcMenuPointerMoveEvent(val point: ArcMenuPoint?, val previous: ArcMenuPoint?)
 data class ArcMenuActivateEvent(

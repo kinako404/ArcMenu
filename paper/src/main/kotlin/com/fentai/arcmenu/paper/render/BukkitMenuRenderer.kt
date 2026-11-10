@@ -32,8 +32,18 @@ import org.joml.Matrix4d
 import org.joml.Matrix4dc
 import org.joml.Matrix4f
 import org.joml.Quaternionf
+import com.fentai.arcmenu.paper.platform.ArcEntityMover
 
 enum class MenuViewMode { FRONTEND_PREVIEW, BACKEND_PREVIEW, RUNTIME }
+
+/**
+ * Teleport interpolation (ticks) for a touch screen following the player's eye height. The client
+ * eases its own camera to a new eye height exponentially (half the remaining distance per tick, 26.3
+ * Camera.tick); the server sees the pose change and the move reaches the client one to two ticks after
+ * the camera started (measured on localhost), so a short two-tick linear move catches up fastest
+ * without looking like a jump.
+ */
+internal const val SURFACE_FOLLOW_TICKS = com.fentai.arcmenu.api.ArcMenuSurfaceMoveEvent.DEFAULT_DURATION_TICKS
 
 /** Private non-persistent Display renderer shared by read-only previews and running menus. */
 class BukkitMenuRenderer(
@@ -101,7 +111,7 @@ class BukkitMenuRenderer(
     }
 
     inner class MenuView(
-        private val player: Player, private val plane: MenuPlane,
+        private val player: Player, private var plane: MenuPlane,
         initialTextOverrides: Map<String, Component> = emptyMap(),
         private val fixedCamera: Boolean = false,
     ) : AutoCloseable {
@@ -139,8 +149,9 @@ class BukkitMenuRenderer(
         private var selected: String? = null
         private var marker: Pair<TextDisplay, TextDisplay>? = null
         private var shown = false
-        private val anchor = Location(player.world, plane.origin.x, plane.origin.y, plane.origin.z)
+        private var anchor = Location(player.world, plane.origin.x, plane.origin.y, plane.origin.z)
         // Entities are positioned at the anchor; their matrices must not add that world translation twice.
+        // The product is translation-free, so it stays valid when [translate] moves plane and anchor together.
         private val base = Matrix4d().translate(-plane.origin.x, -plane.origin.y, -plane.origin.z).mul(plane.matrix())
         val entityCount: Int get() = entities.size
         /** False once any entity is gone or, on Folia, belongs to a region other than the caller's. */
@@ -149,6 +160,19 @@ class BukkitMenuRenderer(
         val misplaced: Boolean get() = entities.any { it.isValid && !ArcScheduler.owns(it) }
 
         private fun id(display: Display): Int = ids.getOrPut(display) { display.entityId }
+
+        /**
+         * Moves the whole view rigidly to [next] (same axes and canvas, translated origin). Every
+         * entity keeps its anchor-relative matrix; the client interpolates the move over the
+         * teleport duration set at spawn ([SURFACE_FOLLOW_TICKS]).
+         */
+        fun translate(next: MenuPlane) {
+            val offset = next.origin - plane.origin
+            plane = next
+            anchor = Location(player.world, next.origin.x, next.origin.y, next.origin.z)
+            if (layerEye != null) layerEye = layerEye!! + offset
+            entities.forEach { ArcEntityMover.moveBy(it, offset) }
+        }
 
         fun refreshDepthEye() {
             if (layerEye == null) return
@@ -703,7 +727,9 @@ class BukkitMenuRenderer(
                 it.billboard = Display.Billboard.FIXED
                 it.brightness = Display.Brightness(15, 15)
                 it.interpolationDuration = 0
-                it.teleportDuration = 0
+                // View entities are only ever moved by [translate]; a preset duration makes the
+                // client interpolate that move from the very first one.
+                it.teleportDuration = SURFACE_FOLLOW_TICKS
             }
             entities += display
             ids[display] = display.entityId

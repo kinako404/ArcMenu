@@ -1,6 +1,5 @@
 package com.fentai.arcmenu.paper.input
 
-import com.fentai.arcmenu.paper.runtime.PointerButton
 import com.comphenix.protocol.PacketType
 import com.comphenix.protocol.ProtocolLibrary
 import com.comphenix.protocol.events.ListenerOptions
@@ -28,8 +27,10 @@ internal class ProtocolPointerBridge(
     private val rotation: (Player, Float, Float) -> Boolean,
     private val position: (Player) -> Boolean,
     private val syntheticTeleportAccepted: (Player, Int) -> Unit,
-    private val input: (Player, PointerButton) -> Boolean,
+    private val input: (Player, ClickSource) -> Boolean,
     private val activeInput: (Player) -> Boolean,
+    private val observedRotation: (Player, Float, Float) -> Unit = { _, _, _ -> },
+    private val clientTickEnd: (Player) -> Unit = {},
 ) : AutoCloseable {
     private val manager = ProtocolLibrary.getProtocolManager()
     private val nextSyntheticTeleportId = AtomicInteger(-1)
@@ -44,6 +45,10 @@ internal class ProtocolPointerBridge(
     private val attackPacketTypes = PacketType.values().filter { type ->
         type.protocol == PacketType.Protocol.PLAY && type.isClient && type.isSupported &&
             type.classNames.any { it.contains("ServerboundAttackPacket") }
+    }.toSet()
+    private val tickEndPacketTypes = PacketType.values().filter { type ->
+        type.protocol == PacketType.Protocol.PLAY && type.isClient && type.isSupported &&
+            type.classNames.any { it.contains("ClientTickEnd") }
     }.toSet()
     private val interactions by lazy {
         LocalInteractionPackets(PacketType.Play.Client.USE_ENTITY.packetClass,
@@ -61,14 +66,18 @@ internal class ProtocolPointerBridge(
             PacketType.Play.Client.ARM_ANIMATION,
             PacketType.Play.Client.USE_ITEM,
             PacketType.Play.Client.USE_ITEM_ON,
-        ).filter { it.isSupported } + middlePacketTypes + attackPacketTypes,
+        ).filter { it.isSupported } + middlePacketTypes + attackPacketTypes + tickEndPacketTypes,
         ListenerOptions.ASYNC,
     ) {
         override fun onPacketReceiving(event: PacketEvent) {
             if (event.isPlayerTemporary) return
             val consumed = when (event.packetType) {
-                PacketType.Play.Client.LOOK -> consumeRotation(event)
+                PacketType.Play.Client.LOOK -> {
+                    observeRotation(event)
+                    consumeRotation(event)
+                }
                 PacketType.Play.Client.POSITION_LOOK -> {
+                    observeRotation(event)
                     val synthetic = claimSyntheticResponse(event.player)
                     val cursor = consumeRotation(event)
                     synthetic || cursor
@@ -76,11 +85,16 @@ internal class ProtocolPointerBridge(
                 PacketType.Play.Client.POSITION -> position(event.player)
                 PacketType.Play.Client.TELEPORT_ACCEPT -> consumeSyntheticTeleport(event)
                 PacketType.Play.Client.USE_ENTITY -> consumeEntityInput(event) || consumeSelfInteraction(event)
-                PacketType.Play.Client.ARM_ANIMATION -> consumeHandInput(event, PointerButton.LEFT)
-                PacketType.Play.Client.USE_ITEM, PacketType.Play.Client.USE_ITEM_ON -> consumeHandInput(event, PointerButton.RIGHT)
+                PacketType.Play.Client.ARM_ANIMATION -> consumeHandInput(event, ClickSource.SWING)
+                PacketType.Play.Client.USE_ITEM -> consumeHandInput(event, ClickSource.USE)
+                PacketType.Play.Client.USE_ITEM_ON -> consumeHandInput(event, ClickSource.USE_ON)
                 else -> when {
                     event.packetType in attackPacketTypes -> consumeEntityInput(event)
-                    event.packetType in middlePacketTypes -> input(event.player, PointerButton.MIDDLE)
+                    event.packetType in middlePacketTypes -> input(event.player, ClickSource.PICK)
+                    event.packetType in tickEndPacketTypes -> {
+                        clientTickEnd(event.player)
+                        false
+                    }
                     else -> false
                 }
             }
@@ -144,12 +158,19 @@ internal class ProtocolPointerBridge(
         return fields.size() >= 2 && rotation(event.player, fields.read(0), fields.read(1))
     }
 
+    private fun observeRotation(event: PacketEvent) {
+        val fields = event.packet.float
+        if (fields.size() >= 2) observedRotation(event.player, fields.read(0), fields.read(1))
+    }
+
     private fun consumeSyntheticTeleport(event: PacketEvent): Boolean {
         val integers = event.packet.integers
         if (integers.size() < 1) return false
         val id = integers.read(0)
         val floats = event.packet.float
         val rotationInAccept = floats.size() >= 2
+        // From 26.3 every accept carries the client's rotation after applying the teleport.
+        if (rotationInAccept) observedRotation(event.player, floats.read(0), floats.read(1))
         if (!synthetic.accept(event.player.uniqueId, id, rotationInAccept)) return false
         if (rotationInAccept) rotation(event.player, floats.read(0), floats.read(1))
         syntheticTeleportAccepted(event.player, id)
@@ -161,17 +182,17 @@ internal class ProtocolPointerBridge(
     /** Drops a disconnected player's pending ids and reply credit. */
     fun forget(player: Player) = synthetic.forget(player.uniqueId)
 
-    private fun consumeHandInput(event: PacketEvent, button: PointerButton): Boolean {
+    private fun consumeHandInput(event: PacketEvent, source: ClickSource): Boolean {
         val hand = event.packet.hands.readSafely(0)
         if (hand != null && hand.name != "MAIN_HAND") return false
-        return input(event.player, button)
+        return input(event.player, source)
     }
 
     private fun consumeEntityInput(event: PacketEvent): Boolean {
         if (!activeInput(event.player)) return false
         val click = interactions.read(event.packet.handle) ?: return false
         if (!click.dispatch) return true
-        return input(event.player, if (click.primary) PointerButton.LEFT else PointerButton.RIGHT)
+        return input(event.player, if (click.primary) ClickSource.ATTACK else ClickSource.INTERACT)
     }
 
     private fun consumeSelfInteraction(event: PacketEvent): Boolean {

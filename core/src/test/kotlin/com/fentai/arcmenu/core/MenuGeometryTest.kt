@@ -14,6 +14,27 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 class MenuGeometryTest {
+    @Test
+    fun `translated plane keeps the canvas point of a ray moved by the same offset`() {
+        val plane = MenuPlane(Vec3(10.0, 71.62, 5.0), Vec3(-1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, -1.0),
+            Canvas(pixelsPerBlock = 197.0), viewerEye = Vec3(10.0, 71.62, 4.35))
+        val eye = Vec3(10.0, 71.62, 4.35)
+        val direction = Vec3(0.3, -0.2, 1.0)
+        val before = requireNotNull(plane.project(Ray(eye, direction)))
+        val offset = Vec3(0.0, -0.35, 0.0)
+        val moved = plane.translated(offset)
+        assertEquals(71.27, moved.origin.y, 1e-12)
+        assertEquals(71.27, moved.viewerEye!!.y, 1e-12)
+        assertEquals(plane.right, moved.right)
+        assertEquals(plane.canvas, moved.canvas)
+        val after = requireNotNull(moved.project(Ray(eye + offset, direction)))
+        assertEquals(before.x, after.x, 1e-9)
+        assertEquals(before.y, after.y, 1e-9)
+        // Without the move the same crosshair lands 0.35 blocks (69 px at 197 px per block) lower.
+        val unmoved = requireNotNull(plane.project(Ray(eye + offset, direction)))
+        assertEquals(before.y - 0.35 * 197.0, unmoved.y, 1e-9)
+    }
+
     @ParameterizedTest @ValueSource(doubles = [0.0, 15.0, 90.0, 180.0, 270.0])
     fun `world rays project to known canvas point at different menu orientations`(degrees: Double) {
         val angle = Math.toRadians(degrees)

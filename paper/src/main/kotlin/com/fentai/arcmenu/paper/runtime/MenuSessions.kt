@@ -19,12 +19,15 @@ import com.fentai.arcmenu.paper.api.RegisteredApplication
 import com.fentai.arcmenu.paper.render.ArcitxText
 import com.fentai.arcmenu.paper.render.BukkitMenuRenderer
 import com.fentai.arcmenu.paper.render.MenuViewMode
+import com.fentai.arcmenu.paper.render.SURFACE_FOLLOW_TICKS
+import com.fentai.arcmenu.paper.platform.ArcEntityMover
 import com.fentai.arcmenu.paper.render.TooltipStyles
 import com.fentai.arcmenu.paper.performance.PerformanceMetrics
 import net.kyori.adventure.text.Component
 import org.bukkit.Bukkit
 import org.bukkit.Location
 import org.bukkit.NamespacedKey
+import org.bukkit.entity.Display
 import org.bukkit.entity.Entity
 import org.bukkit.entity.Interaction
 import org.bukkit.entity.Player
@@ -86,11 +89,13 @@ class MenuSessions(
         var editingSince: Long = 0,
         var lastPosition: Vec3? = null,
         var reanchoredAt: Long = -REPAIR_INTERVAL_TICKS,
+        var planeEyeHeight: Double = Double.NaN,
     ) {
         val editingBuffer: ArcitxBuffer? get() = editingArcitx?.let(arcitxBuffers::get)
     }
 
-    private data class Placement(val plane: MenuPlane, val worldId: UUID, val openedAt: Vec3)
+    /** [eyeHeight] is the player's eye height the plane was placed (or last followed) for; NaN when unknown. */
+    private data class Placement(val plane: MenuPlane, val worldId: UUID, val openedAt: Vec3, val eyeHeight: Double = Double.NaN)
     private data class CatcherInput(val owner: Session, val catcher: CatcherAction, val stage: Int)
 
     private inner class HostedApplication(
@@ -112,6 +117,10 @@ class MenuSessions(
         var cursorInteractive = false
         var lastPosition: Vec3? = null
         var reanchoredAt: Long = -REPAIR_INTERVAL_TICKS
+        var planeEyeHeight: Double = Double.NaN
+        /** Tracked displays whose teleport duration was just switched; they move one tick later. */
+        val deferredMoves = linkedMapOf<Entity, Vec3>()
+        val durationRestores = mutableListOf<DurationRestore>()
         @Volatile var active = true
         val trackedEntities = linkedSetOf<Entity>()
         val trackedTasks = linkedSetOf<BukkitTask>()
@@ -120,6 +129,8 @@ class MenuSessions(
         fun cleanupSurfaceEntities() {
             trackedEntities.toList().forEach { runCatching { if (it.isValid) ArcScheduler.remove(plugin, it) } }
             trackedEntities.clear()
+            deferredMoves.clear()
+            durationRestores.clear()
         }
 
         fun cleanupResources() {
@@ -412,9 +423,9 @@ class MenuSessions(
         val previousApplication = applicationSessions[player.uniqueId]
         val transitionKind = if (previous?.mode == MenuViewMode.RUNTIME || previousApplication != null) TransitionKind.SWITCH else TransitionKind.ENTER
         val placement = previous?.takeIf { it.mode == MenuViewMode.RUNTIME }?.let {
-            Placement(it.plane.withCanvas(menu.canvas), it.worldId, it.openedAt)
+            Placement(it.plane.withCanvas(menu.canvas), it.worldId, it.openedAt, it.planeEyeHeight)
         } ?: previousApplication?.let {
-            Placement(it.plane.withCanvas(menu.canvas), it.worldId, it.openedAt)
+            Placement(it.plane.withCanvas(menu.canvas), it.worldId, it.openedAt, it.planeEyeHeight)
         } ?: routePlacement[player.uniqueId]?.let { it.copy(plane = it.plane.withCanvas(menu.canvas)) }
         if (placement != null) routePlacement[player.uniqueId] = placement
 
@@ -502,9 +513,9 @@ class MenuSessions(
         }
         val designCanvas = inheritedDesignCanvas ?: registration.options.canvas.core()
         val inheritedPlacement = previous?.takeIf { it.mode == MenuViewMode.RUNTIME }?.let {
-            Placement(it.plane, it.worldId, it.openedAt)
+            Placement(it.plane, it.worldId, it.openedAt, it.planeEyeHeight)
         } ?: previousApplication?.let {
-            Placement(it.plane, it.worldId, it.openedAt)
+            Placement(it.plane, it.worldId, it.openedAt, it.planeEyeHeight)
         } ?: routePlacement[player.uniqueId]
         if (inheritedPlacement != null) routePlacement[player.uniqueId] = inheritedPlacement
 
@@ -671,6 +682,7 @@ class MenuSessions(
             val previousView = session.view
             val previousCapture = session.capture
             session.plane = nextPlane
+            session.planeEyeHeight = player.eyeHeight
             session.view = createdView
             session.capture = createdCapture
             session.worldId = player.world.uid
@@ -719,6 +731,7 @@ class MenuSessions(
             val previousCapture = runtime.capture
             runtime.cleanupSurfaceEntities()
             runtime.plane = nextPlane
+            runtime.planeEyeHeight = player.eyeHeight
             runtime.overlay = createdOverlay
             runtime.capture = createdCapture
             runtime.worldId = player.world.uid
@@ -753,7 +766,7 @@ class MenuSessions(
         if (stack.isEmpty()) history.remove(player.uniqueId)
         val application = applicationSessions[player.uniqueId]
         if (application != null) {
-            routePlacement[player.uniqueId] = Placement(application.plane, application.worldId, application.openedAt)
+            routePlacement[player.uniqueId] = Placement(application.plane, application.worldId, application.openedAt, application.planeEyeHeight)
             removeApplication(player, ArcMenuApplicationCloseReason.BACK, preservePointer = true)
         }
         return when (target) {
@@ -856,14 +869,19 @@ class MenuSessions(
         if (sessions[player.uniqueId] !== input.owner) catcherInputs.remove(player.uniqueId)
     }
 
-    fun activate(player: Player, button: PointerButton, shift: Boolean = player.isSneaking) {
+    /**
+     * [debounce] guards the Bukkit-event fallbacks (a block click or Paper's punch event can echo a click that
+     * the packet layer already delivered). Packet-layer and editor-channel inputs are de-duplicated per client
+     * tick by [com.fentai.arcmenu.paper.input.ClickPairing] and pass false, so fast clicks are not dropped.
+     */
+    fun activate(player: Player, button: PointerButton, shift: Boolean = player.isSneaking, debounce: Boolean = true) {
         val application = applicationSessions[player.uniqueId]
         if (application != null) {
             if (!acceptsActivation(application.pointerMode, button)) return
             if (application.pointerMode == PointerMode.MOUSE && !pointer.isReady(player)) return
             val now = System.nanoTime()
             val previous = lastActivation.put(player.uniqueId, now)
-            if (previous != null && now - previous < CLICK_DEBOUNCE_NANOS) return
+            if (debounce && previous != null && now - previous < CLICK_DEBOUNCE_NANOS) return
             val point = pointer.sample(player, application.plane)
             invokeApplication(application, "activate") {
                 application.callback?.onActivate(
@@ -878,7 +896,7 @@ class MenuSessions(
         if (session.pointerMode == PointerMode.MOUSE && !pointer.isReady(player)) return
         val now = System.nanoTime()
         val previous = lastActivation.put(player.uniqueId, now)
-        if (previous != null && now - previous < CLICK_DEBOUNCE_NANOS) return
+        if (debounce && previous != null && now - previous < CLICK_DEBOUNCE_NANOS) return
         val point = pointer.sample(player, session.plane)
         val region = session.hitTester.hit(point)
         if (session.mode != MenuViewMode.RUNTIME) {
@@ -1067,6 +1085,7 @@ class MenuSessions(
                 textNodes(menu.frontend), imageNodes(menu.frontend),
                 timeline, pointerMode, initialAnimation.snapshot, initialAnimation.transitionActive,
                 arcitxBuffers = arcitxBuffers,
+                planeEyeHeight = placement?.eyeHeight?.takeUnless { it.isNaN() } ?: player.eyeHeight,
             )
             sessions[player.uniqueId] = session
             ensureTicker(player)
@@ -1119,6 +1138,7 @@ class MenuSessions(
                 activeMode,
             )
             runtime.context = ApplicationContext(runtime)
+            runtime.planeEyeHeight = placement?.eyeHeight?.takeUnless { it.isNaN() } ?: player.eyeHeight
             runtime.lastPoint = pointer.sample(player, applicationPlane)
             applicationSessions[player.uniqueId] = runtime
             if (!applicationRegistry.contains(registration.token)) {
@@ -1161,7 +1181,7 @@ class MenuSessions(
                 openRoute(
                     player,
                     target,
-                    placement ?: Placement(applicationPlane, player.world.uid, vec(player.location.toVector())),
+                    placement ?: Placement(applicationPlane, player.world.uid, vec(player.location.toVector()), player.eyeHeight),
                 )
             }
             return false
@@ -1216,6 +1236,7 @@ class MenuSessions(
                 if (session.ticks % REPAIR_INTERVAL_TICKS == 0L) reanchorRuntime(player)
                 return
             }
+            if (session.pointerMode == PointerMode.TOUCH) followEyeHeight(session)
         } else {
             val delta = vec(player.location.toVector()) - session.openedAt
             val cameraInvalid = session.pointerMode == PointerMode.MOUSE && !pointer.hasValidCamera(player)
@@ -1346,6 +1367,7 @@ class MenuSessions(
             if (runtime.ticks % REPAIR_INTERVAL_TICKS == 0L) reanchorApplication(runtime)
             return
         }
+        if (runtime.pointerMode == PointerMode.TOUCH && !followEyeHeight(runtime)) return
         if (runtime.pointerMode == PointerMode.MOUSE && !pointer.isReady(player)) return
         runtime.overlay.refreshDepthEye()
         if (runtime.pointerMode == PointerMode.MOUSE) pointer.poll(player)
@@ -1451,7 +1473,7 @@ class MenuSessions(
     /** Closes a disabled application on the thread that owns its player, then reopens the previous route. */
     private fun closeDisabledApplication(runtime: HostedApplication) = onPlayerThread(runtime.player) {
         if (applicationSessions[runtime.player.uniqueId] !== runtime) return@onPlayerThread
-        val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt)
+        val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt, runtime.planeEyeHeight)
         val target = pollHistory(runtime.player)
         removeApplication(
             runtime.player,
@@ -1479,7 +1501,7 @@ class MenuSessions(
             callback()
             runtime.active && applicationSessions[runtime.player.uniqueId] === runtime
         } catch (error: Throwable) {
-            val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt)
+            val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt, runtime.planeEyeHeight)
             val target = pollHistory(runtime.player)
             reportApplicationFailure(runtime.player, runtime.registration.id, phase, error)
             removeApplication(
@@ -1600,6 +1622,72 @@ class MenuSessions(
         arcitx.close()
     }
 
+    /** Touch mode: moves a YAML menu with the player's eye height so the crosshair keeps its canvas point. */
+    private fun followEyeHeight(session: Session) {
+        val player = session.player
+        val height = player.eyeHeight
+        val offset = eyeFollowOffset(session.planeEyeHeight, height) ?: return
+        session.planeEyeHeight = height
+        session.plane = session.plane.translated(offset)
+        session.view.translate(session.plane)
+        if (session.capture.isValid) ArcEntityMover.moveBy(session.capture, offset)
+        routePlacement.computeIfPresent(player.uniqueId) { _, it -> it.copy(plane = it.plane.translated(offset), eyeHeight = height) }
+    }
+
+    /**
+     * Application counterpart of [followEyeHeight]: also moves every tracked entity and tells the application.
+     * Returns false when the application closed from inside its callback.
+     */
+    private fun followEyeHeight(runtime: HostedApplication): Boolean {
+        val player = runtime.player
+        if (runtime.deferredMoves.isNotEmpty()) {
+            runtime.deferredMoves.forEach { (entity, offset) -> moveTracked(entity, offset) }
+            runtime.deferredMoves.clear()
+        }
+        if (runtime.durationRestores.isNotEmpty()) runtime.durationRestores.removeIf { restore ->
+            if (runtime.ticks < restore.dueTick) return@removeIf false
+            val display = restore.display
+            if (display.isValid && ArcScheduler.owns(display) && display.teleportDuration == SURFACE_FOLLOW_TICKS) {
+                display.teleportDuration = restore.original
+            }
+            true
+        }
+        val height = player.eyeHeight
+        val offset = eyeFollowOffset(runtime.planeEyeHeight, height) ?: return true
+        runtime.planeEyeHeight = height
+        runtime.plane = runtime.plane.translated(offset)
+        runtime.overlay.translate(runtime.plane)
+        if (runtime.capture.isValid) ArcEntityMover.moveBy(runtime.capture, offset)
+        routePlacement.computeIfPresent(player.uniqueId) { _, it -> it.copy(plane = it.plane.translated(offset), eyeHeight = height) }
+        runtime.trackedEntities.forEach { entity ->
+            if (!entity.isValid || !ArcScheduler.owns(entity)) return@forEach
+            val display = entity as? Display
+            if (display == null || display.teleportDuration == SURFACE_FOLLOW_TICKS) {
+                moveTracked(entity, offset)
+                return@forEach
+            }
+            // Entity metadata is sent after the move packet of the same tick, so a changed duration
+            // only applies to the next move: switch it now, move next tick, restore it afterwards.
+            if (runtime.durationRestores.none { it.display === display }) {
+                runtime.durationRestores += DurationRestore(display, display.teleportDuration,
+                    runtime.ticks + SURFACE_FOLLOW_TICKS + 2)
+            }
+            display.teleportDuration = SURFACE_FOLLOW_TICKS
+            runtime.deferredMoves.merge(entity, offset) { previous, next -> previous + next }
+        }
+        val moved = Vector(offset.x, offset.y, offset.z)
+        return invokeApplication(runtime, "surface") {
+            runtime.callback?.onSurfaceMoved(ArcMenuSurfaceMoveEvent(runtime.context.surface(), moved, SURFACE_FOLLOW_TICKS))
+        }
+    }
+
+    private fun moveTracked(entity: Entity, offset: Vec3) {
+        if (!entity.isValid || !ArcScheduler.owns(entity)) return
+        runCatching { ArcEntityMover.moveBy(entity, offset) }.onFailure {
+            plugin.logger.warning("ArcMenu could not move ${entity.type} with the screen: ${it.message.orEmpty()}")
+        }
+    }
+
     private fun capture(player: Player, plane: MenuPlane): Interaction {
         val worldWidth = max(plane.canvas.width / plane.canvas.pixelsPerBlock, 0.1)
         val worldHeight = max(plane.canvas.height / plane.canvas.pixelsPerBlock, 0.1)
@@ -1625,7 +1713,7 @@ class MenuSessions(
         // The camera entity's yaw reaches the client as a byte. Mouse mode must
         // build its plane from that same decoded angle or the near-eye screen
         // becomes a subtly trapezoidal projection.
-        val yaw = if (pointerMode == PointerMode.MOUSE) networkCameraAngle(eye.yaw) else eye.yaw
+        val yaw = if (pointerMode == PointerMode.MOUSE) networkCameraAngle(eye.yaw) else pointer.viewYaw(player)
         val forward = Vector(-kotlin.math.sin(Math.toRadians(yaw.toDouble())), 0.0, kotlin.math.cos(Math.toRadians(yaw.toDouble())))
         val normal = forward.clone().multiply(-1)
         val up = Vector(0, 1, 0)
@@ -1773,6 +1861,20 @@ private fun PointerMode.api(): ArcMenuPointerMode = ArcMenuPointerMode.valueOf(n
 private fun PointerButton.api(): ArcMenuPointerButton = ArcMenuPointerButton.valueOf(name)
 
 internal const val RUNTIME_REANCHOR_DISTANCE = 128.0
+private const val EYE_FOLLOW_EPSILON = 1.0e-4
+
+internal class DurationRestore(val display: Display, val original: Int, val dueTick: Long)
+
+/**
+ * Vertical move that keeps a touch screen at the same height relative to the eye after the eye height changed
+ * from [planeEyeHeight] to [eyeHeight] (pose change: sneaking, standing up, swimming, crawling, gliding).
+ * Null when nothing has to move or either height is unknown.
+ */
+internal fun eyeFollowOffset(planeEyeHeight: Double, eyeHeight: Double): Vec3? {
+    if (!planeEyeHeight.isFinite() || !eyeHeight.isFinite()) return null
+    val delta = eyeHeight - planeEyeHeight
+    return if (kotlin.math.abs(delta) < EYE_FOLLOW_EPSILON) null else Vec3(0.0, delta, 0.0)
+}
 private const val TOUCH_TELEPORT_JUMP = 8.0
 private const val MOUSE_TELEPORT_JUMP = 1.0
 

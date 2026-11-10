@@ -111,7 +111,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         state = RuntimeStateStore(this, language)
         val placeholders = PlaceholderResolver(this, state, language)
         pointer = PointerController(this, PointerSettingsLoader.load(this), performance::entitySpawn) { player, button, shift ->
-            if (::sessions.isInitialized) sessions.activate(player, button, shift)
+            if (::sessions.isInitialized) sessions.activate(player, button, shift, debounce = false)
         }
         renderer.depthEye = { player, plane, fixedCamera ->
             (if (fixedCamera) pointer.fixedCameraEye(player) ?: plane.viewerEye else null)
@@ -371,16 +371,19 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     @EventHandler(priority = EventPriority.HIGHEST)
     fun onInteract(event: PlayerInteractEvent) {
         if (!sessions.contains(event.player)) return
-        if (event.hand != EquipmentSlot.HAND) return
         val button = when (event.action) {
             Action.LEFT_CLICK_AIR, Action.LEFT_CLICK_BLOCK -> PointerButton.LEFT
             Action.RIGHT_CLICK_AIR, Action.RIGHT_CLICK_BLOCK -> PointerButton.RIGHT
             else -> return
         }
-        if (event.action != Action.PHYSICAL) {
-            event.isCancelled = true
-            sessions.activate(event.player, button)
-        }
+        // An open menu owns every click: no block is mined or used and no item is used, off hand included
+        // (the off hand only acts when the main hand passed, e.g. aiming past a touch screen at a block).
+        event.isCancelled = true
+        if (event.hand != EquipmentSlot.HAND) return
+        // From 26.3 a left click is an attack (or block) packet plus a punch packet; Paper turns the punch into
+        // LEFT_CLICK_AIR when its ray trace misses. The packet layer has already delivered that click.
+        if (event.action == Action.LEFT_CLICK_AIR && pointer.isInputActive(event.player)) return
+        sessions.activate(event.player, button)
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)

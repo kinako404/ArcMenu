@@ -15,6 +15,9 @@ data class MenuPlane @JvmOverloads constructor(
     /** Reuses the first-open world anchor and axes while adopting the next menu's logical canvas. */
     fun withCanvas(nextCanvas: Canvas) = copy(canvas = nextCanvas)
 
+    /** The same screen moved rigidly by [offset]; a ray moved by the same offset hits the same canvas point. */
+    fun translated(offset: Vec3) = copy(origin = origin + offset, viewerEye = viewerEye?.let { it + offset })
+
     fun project(ray: Ray): MenuPoint? {
         val denominator = ray.direction.dot(normal)
         if (!denominator.isFinite() || denominator >= -1e-9) return null

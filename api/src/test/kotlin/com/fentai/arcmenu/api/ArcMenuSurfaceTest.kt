@@ -37,6 +37,27 @@ class ArcMenuSurfaceTest {
     }
 
     @Test
+    fun `surface move event is optional for sessions and does not expose a mutable offset`() {
+        val session = object : ArcMenuApplicationSession() {}
+        val world = Proxy.newProxyInstance(World::class.java.classLoader, arrayOf(World::class.java)) { proxy, method, args ->
+            when (method.name) {
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.get(0)
+                else -> null
+            }
+        } as World
+        val surface = ArcMenuSurface(world, Location(world, 0.0, 0.0, 0.0), Vector(1, 0, 0), Vector(0, 1, 0),
+            Vector(0, 0, 1), ArcMenuCanvas(320.0, 180.0, 100.0, 3.0))
+        val offset = Vector(0.0, -0.35, 0.0)
+        val event = ArcMenuSurfaceMoveEvent(surface, offset, ArcMenuSurfaceMoveEvent.DEFAULT_DURATION_TICKS)
+        session.onSurfaceMoved(event)
+        offset.setY(5.0)
+        event.offset().setY(7.0)
+        assertEquals(-0.35, event.offset().y, 1.0e-9)
+        assertEquals(2, event.durationTicks)
+    }
+
+    @Test
     fun `application option defaults are safe and explicit`() {
         val options = ArcMenuApplicationOptions.DEFAULT
         assertEquals(true, options.inheritCanvas)

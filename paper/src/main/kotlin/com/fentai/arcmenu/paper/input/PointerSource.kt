@@ -116,11 +116,16 @@ class PointerController(
 
     private val activeInputs = ConcurrentHashMap.newKeySet<UUID>()
     private val suspendedInputs = ConcurrentHashMap.newKeySet<UUID>()
-    private val touch = TouchPointer()
+    private val viewRotations = ConcurrentHashMap<UUID, ViewRotation>()
+    private val clickPairings = ConcurrentHashMap<UUID, ClickPairing>()
+    private val touch = TouchPointer { viewRotations[it.uniqueId] }
     private val cursors = ConcurrentHashMap<UUID, CursorState>()
     private val menuInput = MenuInputBridge(plugin, { it.uniqueId in activeInputs && it.uniqueId !in suspendedInputs }, activated)
     private val preferenceKey = NamespacedKey(plugin, "pointer-mode")
-    private val packets = ProtocolPointerBridge(plugin, ::consumeRotation, ::consumePosition, ::acceptSyntheticTeleport, ::consumeInput, { it.uniqueId in activeInputs })
+    private val packets = ProtocolPointerBridge(
+        plugin, ::consumeRotation, ::consumePosition, ::acceptSyntheticTeleport, ::consumeInput,
+        { it.uniqueId in activeInputs }, ::observeRotation, { player -> clickPairings[player.uniqueId]?.tickEnd() },
+    )
     @Volatile var settings: PointerSettings = initialSettings
         private set
 
@@ -289,6 +294,8 @@ class PointerController(
     fun discard(player: Player) {
         activeInputs.remove(player.uniqueId)
         suspendedInputs.remove(player.uniqueId)
+        viewRotations.remove(player.uniqueId)
+        clickPairings.remove(player.uniqueId)
         menuInput.forget(player)
         packets.forget(player)
         val state = cursors.remove(player.uniqueId) ?: return
@@ -333,6 +340,12 @@ class PointerController(
     }
 
     fun isMouseActive(player: Player): Boolean = cursors.containsKey(player.uniqueId)
+
+    /** True while the packet layer owns this player's clicks (any open runtime menu or application). */
+    fun isInputActive(player: Player): Boolean = player.uniqueId in activeInputs
+
+    /** Yaw the client last reported (see [ViewRotation]); the server's own value when none is known. */
+    fun viewYaw(player: Player): Float = viewRotations[player.uniqueId]?.yaw ?: player.location.yaw
 
     fun mode(player: Player): PointerMode = when (settings.policy) {
         PointerPolicy.FORCE_TOUCH -> PointerMode.TOUCH
@@ -409,10 +422,16 @@ class PointerController(
         return true
     }
 
-    private fun consumeInput(player: Player, button: PointerButton): Boolean {
+    private fun observeRotation(player: Player, yaw: Float, pitch: Float) {
+        if (yaw.isFinite() && pitch.isFinite()) viewRotations[player.uniqueId] = ViewRotation(yaw, pitch)
+    }
+
+    private fun consumeInput(player: Player, source: ClickSource): Boolean {
         if (player.uniqueId !in activeInputs) return false
         if (player.uniqueId in suspendedInputs) return true
         if (menuInput.listening(player)) return true
+        val button = clickPairings.computeIfAbsent(player.uniqueId) { ClickPairing() }.accept(source, System.nanoTime())
+            ?: return true
         ArcScheduler.execute(plugin, player, Runnable {
             if (player.uniqueId in activeInputs && player.uniqueId !in suspendedInputs) activated(player, button, player.isSneaking)
         })
@@ -481,6 +500,8 @@ class PointerController(
         cursors.clear()
         activeInputs.clear()
         suspendedInputs.clear()
+        viewRotations.clear()
+        clickPairings.clear()
         menuInput.close()
         packets.close()
     }
@@ -523,11 +544,81 @@ private fun wrapVirtualCursorDegrees(value: Double): Double {
     return result
 }
 
-class TouchPointer : PointerSource {
+/**
+ * Rotation from the client's own movement packets (LOOK, POSITION_LOOK, and the 26.3 teleport accept).
+ * CraftBukkit's PlayerMoveEvent path drops the first rotation packet that crosses its 10-degree event
+ * threshold after any server teleport when smaller turns preceded it (`justTeleported` stays set until
+ * then); the client never resends an unchanged rotation, so the server's yaw/pitch can stay stale until
+ * the player turns again. The crosshair is what the client last reported, so touch sampling uses this.
+ */
+data class ViewRotation(val yaw: Float, val pitch: Float)
+
+class TouchPointer(private val reported: (Player) -> ViewRotation? = { null }) : PointerSource {
     override fun sample(player: Player, plane: MenuPlane): MenuPoint? {
         val eye = player.eyeLocation
-        val direction = eye.direction
-        return plane.project(Ray(Vec3(eye.x, eye.y, eye.z), Vec3(direction.x, direction.y, direction.z)))
+        val rotation = reported(player) ?: ViewRotation(eye.yaw, eye.pitch)
+        return plane.project(Ray(Vec3(eye.x, eye.y, eye.z), viewDirection(rotation.yaw, rotation.pitch)))
+    }
+}
+
+/** Same convention as Bukkit's Location.getDirection(). */
+internal fun viewDirection(yaw: Float, pitch: Float): Vec3 {
+    val yawRadians = Math.toRadians(yaw.toDouble())
+    val pitchRadians = Math.toRadians(pitch.toDouble())
+    val horizontal = kotlin.math.cos(pitchRadians)
+    return Vec3(-horizontal * kotlin.math.sin(yawRadians), -kotlin.math.sin(pitchRadians), horizontal * kotlin.math.cos(yawRadians))
+}
+
+enum class ClickSource { ATTACK, INTERACT, USE_ON, USE, SWING, PICK }
+
+/**
+ * Folds the packets one physical click produces into a single activation. Within one client tick
+ * (closed by the client's tick-end packet from 1.21.2; before that a [windowNanos] group starting at the
+ * first input): at most one LEFT, one RIGHT and one MIDDLE, and an arm swing only counts when no other
+ * click packet came first (older clients swing after attacking or using an entity, block or item, and a
+ * block use that passes falls through to an item use). Separate clicks in separate client ticks are never
+ * merged, so up to 20 clicks per second per button reach the menu.
+ */
+internal class ClickPairing(private val windowNanos: Long = PAIR_WINDOW_NANOS) {
+    private var tickEnds = false
+    private var groupStart = 0L
+    private var grouped = false
+    private var left = false
+    private var right = false
+    private var middle = false
+
+    @Synchronized
+    fun tickEnd() {
+        tickEnds = true
+        reset()
+    }
+
+    @Synchronized
+    fun accept(source: ClickSource, now: Long): PointerButton? {
+        if (!tickEnds && (!grouped || now - groupStart > windowNanos)) {
+            reset()
+            grouped = true
+            groupStart = now
+        }
+        return when (source) {
+            ClickSource.SWING -> if (left || right || middle) null else PointerButton.LEFT.also { left = true }
+            ClickSource.ATTACK -> if (left) null else PointerButton.LEFT.also { left = true }
+            ClickSource.INTERACT, ClickSource.USE_ON, ClickSource.USE ->
+                if (right) null else PointerButton.RIGHT.also { right = true }
+            ClickSource.PICK -> if (middle) null else PointerButton.MIDDLE.also { middle = true }
+        }
+    }
+
+    private fun reset() {
+        grouped = false
+        left = false
+        right = false
+        middle = false
+    }
+
+    companion object {
+        /** Packets of one client tick leave together; consecutive ticks are 50 ms apart. */
+        const val PAIR_WINDOW_NANOS = 30_000_000L
     }
 }
 
