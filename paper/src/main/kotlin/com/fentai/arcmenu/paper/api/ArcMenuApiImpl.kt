@@ -8,8 +8,10 @@ import com.fentai.arcmenu.paper.platform.ArcScheduler
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
 import java.util.UUID
+import java.util.function.Consumer
 
 internal class ArcMenuApiImpl(
+    private val plugin: Plugin,
     private val sessions: MenuSessions,
     private val routes: ExtensionRoutes,
     private val applications: ApplicationRegistry,
@@ -23,7 +25,19 @@ internal class ArcMenuApiImpl(
         sessions.open(player, menuId.lowercase(), remember = true, arguments = arguments.toList())
     }
 
-    override fun close(player: Player) = sync<Unit>(player) { sessions.close(player, true) }
+    override fun close(player: Player) {
+        if (ArcScheduler.mayTouch(player)) sessions.close(player, true)
+        else if (player.isOnline) ArcScheduler.execute(plugin, player, Runnable { sessions.close(player, true) })
+    }
+
+    override fun runFor(player: Player, task: Consumer<ArcMenuApi>): Boolean {
+        if (ArcScheduler.mayTouch(player)) {
+            task.accept(this)
+            return true
+        }
+        if (!player.isOnline) return false
+        return ArcScheduler.execute(plugin, player, Runnable { if (player.isOnline) task.accept(this) })
+    }
 
     override fun openApplication(player: Player, applicationId: String, arguments: List<String>): Boolean = sync(player) {
         sessions.openApplication(player, applicationId.lowercase(), remember = true, arguments = arguments.toList())
@@ -66,8 +80,7 @@ internal class ArcMenuApiImpl(
     }
 
     override fun unregisterApplications(owner: Plugin) = sync<Unit> {
-        sessions.closeApplications(owner)
-        applications.unregister(owner)
+        sessions.closeApplicationRegistrations(applications.unregister(owner))
     }
 
     override fun applications(): Set<String> = sync { applications.ids() }
@@ -97,7 +110,7 @@ internal class ArcMenuApiImpl(
 
     /** Player operations must run on the thread that owns the player (Paper: the main thread). */
     private fun <T> sync(player: Player, operation: () -> T): T {
-        check(ArcScheduler.mayTouch(player)) { "ArcMenu 玩家 API 必须在玩家所属的区域线程调用（Paper 为主线程）" }
+        check(ArcScheduler.mayTouch(player)) { "ArcMenu 玩家 API 必须在玩家所属的区域线程调用（Paper 为主线程）；其它线程请用 runFor / openAsync" }
         return operation()
     }
 
@@ -109,8 +122,7 @@ internal class ArcMenuApiImpl(
         override fun isRegistered(): Boolean = sync { applications.contains(token) }
 
         override fun unregister() = sync<Unit> {
-            sessions.closeApplicationRegistration(token)
-            applications.unregister(token)
+            applications.unregister(token)?.let { sessions.closeApplicationRegistrations(listOf(it)) }
         }
     }
 }

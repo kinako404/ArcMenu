@@ -4,6 +4,7 @@ import com.fentai.arcmenu.api.ArcMenuApplication
 import com.fentai.arcmenu.api.ArcMenuApplicationOptions
 import org.bukkit.plugin.Plugin
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 internal data class RegisteredApplication(
     val token: UUID,
@@ -16,6 +17,7 @@ internal data class RegisteredApplication(
 /** Thread-safe: Folia may register, look up and unregister from different threads. */
 class ApplicationRegistry internal constructor() {
     private val registrations = linkedMapOf<String, RegisteredApplication>()
+    private val tokens = ConcurrentHashMap<UUID, RegisteredApplication>()
 
     @Synchronized
     internal fun register(
@@ -28,26 +30,28 @@ class ApplicationRegistry internal constructor() {
         val id = normalize(applicationId)
         require(registrations[id] == null) { "应用 $id 已由 ${registrations[id]?.owner?.name} 注册" }
         validate(options)
-        return RegisteredApplication(UUID.randomUUID(), owner, id, options, application).also { registrations[id] = it }
+        return RegisteredApplication(UUID.randomUUID(), owner, id, options, application).also {
+            registrations[id] = it
+            tokens[it.token] = it
+        }
     }
 
     @Synchronized
     internal fun get(applicationId: String): RegisteredApplication? = registrations[applicationId.lowercase()]
 
-    @Synchronized
-    internal fun contains(token: UUID): Boolean = registrations.values.any { it.token == token }
+    internal fun contains(token: UUID): Boolean = tokens.containsKey(token)
 
     @Synchronized
     internal fun unregister(token: UUID): RegisteredApplication? {
-        val entry = registrations.entries.firstOrNull { it.value.token == token } ?: return null
-        registrations.remove(entry.key)
-        return entry.value
+        val removed = tokens.remove(token) ?: return null
+        registrations.remove(removed.id, removed)
+        return removed
     }
 
     @Synchronized
     internal fun unregister(owner: Plugin): List<RegisteredApplication> {
         val removed = registrations.values.filter { it.owner === owner }
-        registrations.entries.removeIf { it.value.owner === owner }
+        removed.forEach { registrations.remove(it.id); tokens.remove(it.token) }
         return removed
     }
 

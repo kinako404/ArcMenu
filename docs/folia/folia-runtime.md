@@ -33,7 +33,7 @@ Paper 上的行为：归属检查恒真；`/tp` 仍由 `onTeleport` 重锚（与
 ## ② P1 入口线程（R§2.4、R§2.7）
 
 - `ArcMenuPlugin.onCommand` 开头：发送者是玩家而当前线程不拥有该玩家时（别的插件在全局 / 异步 / 别的区域线程上 `commandMap.dispatch(player, …)` 或直接调 `Command.execute`），`ArcScheduler.execute` 跳到玩家线程再执行整条子命令（覆盖 open / close / mode / animate / pointer 等所有以玩家为对象的子命令）。实测控制台 `execute as <玩家> run arcmenu …` 的 Bukkit 发送者仍是控制台（见 ⑦），不会走到这里；`Bukkit.dispatchCommand(player, …)` 在 Folia 上会被服务端自己的 `ensureTickThread` 拒绝。
-- 自定义菜单命令（`open-commands`）：没有改 `MenuCommandRegistry.kt`（归 folia-reload-api），而是在 `ArcMenuPlugin` 构造它的 opener 回调里先跳玩家线程再 `openRoot`。
+- 自定义菜单命令（`open-commands`）：本分支原先在 `ArcMenuPlugin` 构造 opener 回调时先跳玩家线程；合并进 `folia` 时与 folia-reload-api 在 `MenuOpenCommand.execute` 里做的同一转发去重，只保留后者（覆盖所有 opener），opener 恢复为直接 `openRoot`。
 - Paper：命令本来就在主线程，`owns` 为真，当场执行。
 
 ## ③ P1 跨玩家动作与软依赖（R§2.3、R§2.6）

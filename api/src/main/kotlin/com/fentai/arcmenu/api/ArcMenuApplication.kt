@@ -1,5 +1,6 @@
 package com.fentai.arcmenu.api
 
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask
 import org.bukkit.Location
 import org.bukkit.World
 import org.bukkit.entity.Entity
@@ -9,7 +10,10 @@ import org.bukkit.scheduler.BukkitTask
 import org.bukkit.util.Vector
 import java.util.function.Consumer
 
-/** A third-party application factory. One session instance is created for each open player. */
+/**
+ * A third-party application factory. One session instance is created for each open player.
+ * [open] runs on the thread that owns that player; on Folia factories for different players may run concurrently.
+ */
 fun interface ArcMenuApplication {
     fun open(context: ArcMenuApplicationContext): ArcMenuApplicationSession
 }
@@ -17,7 +21,8 @@ fun interface ArcMenuApplication {
 /**
  * Per-player application callbacks. Extend this class from Java and override only the events used by the app.
  * Every callback is invoked on the thread that owns the player: the main thread on Paper, the player's
- * region thread on Folia.
+ * region thread on Folia. Callbacks of one session are serial and follow the player across regions; on Folia
+ * sessions of different players run concurrently, so state shared between sessions must be thread-safe.
  */
 abstract class ArcMenuApplicationSession {
     open fun onSurfaceChanged(event: ArcMenuSurfaceEvent) = Unit
@@ -29,7 +34,10 @@ abstract class ArcMenuApplicationSession {
     open fun onClose(event: ArcMenuApplicationCloseEvent) = Unit
 }
 
-/** Stable navigation and resource boundary owned by one application session. */
+/**
+ * Stable navigation and resource boundary owned by one application session. [isActive], [execute] and the
+ * `track` methods may be called from any thread; every other method must run on the thread that owns [player].
+ */
 interface ArcMenuApplicationContext {
     val player: Player
     val applicationId: String
@@ -43,18 +51,36 @@ interface ArcMenuApplicationContext {
     /** Changes only the ArcMenu cursor glyph; applications still decide their own hit regions. */
     fun setCursorInteractive(interactive: Boolean)
 
-    /** Tracked objects are forcibly cleaned when this session closes. */
+    /**
+     * Tracked objects are forcibly cleaned when this session closes. On Folia [spawnPrivate] needs a
+     * location inside the region that currently owns the player.
+     */
     fun <T : Entity> spawnPrivate(location: Location, type: Class<T>, initializer: Consumer<T>): T
     fun <T : Entity> track(entity: T): T
     fun <T : BukkitTask> track(task: T): T
     fun <T : AutoCloseable> track(resource: T): T
 
-    /** Runs only if this exact application session is still active, on the thread that owns the player. */
+    /**
+     * Cancels a Paper/Folia region-scheduler task (entity, region, global or async scheduler) when this
+     * session closes. Use this for tasks that need a real scheduler handle instead of [runLater]/[runTimer].
+     */
+    fun <T : ScheduledTask> track(task: T): T {
+        track(AutoCloseable { task.cancel() })
+        return task
+    }
+
+    /**
+     * Runs only if this exact application session is still active, on the thread that owns the player.
+     * Runs synchronously when the caller already owns the player; returns false when it cannot be scheduled.
+     */
     fun execute(task: Runnable): Boolean
 
     /**
-     * Player-scheduler tasks (Paper/Folia entity scheduler; they follow the player across regions).
-     * The returned handle supports cancel()/isCancelled(); its task id is always -1.
+     * Player-scheduler tasks (Paper/Folia entity scheduler; they follow the player across regions, and on Paper
+     * they run in the entity-scheduler phase of the tick). The returned handle supports cancel()/isCancelled()
+     * only: its task id is always -1, so BukkitScheduler.cancelTask/isQueued/isCurrentlyRunning do not apply.
+     * When the player has already left the returned handle is born cancelled. For a real handle schedule on
+     * `player.scheduler` yourself and pass the ScheduledTask to [track].
      */
     fun runLater(delayTicks: Long, task: Runnable): BukkitTask
     fun runTimer(delayTicks: Long, periodTicks: Long, task: Runnable): BukkitTask

@@ -1121,6 +1121,10 @@ class MenuSessions(
             runtime.context = ApplicationContext(runtime)
             runtime.lastPoint = pointer.sample(player, applicationPlane)
             applicationSessions[player.uniqueId] = runtime
+            if (!applicationRegistry.contains(registration.token)) {
+                closeDisabledApplication(runtime)
+                return false
+            }
             runtime.lastPoint?.let { point -> cursorStyle?.let { overlay.updateCursor(point, it) } }
 
             val callback = registration.application.open(runtime.context)
@@ -1130,6 +1134,10 @@ class MenuSessions(
                     callback.onClose(ArcMenuApplicationCloseEvent(ArcMenuApplicationCloseReason.REPLACED))
                 }
                 return true
+            }
+            if (!applicationRegistry.contains(registration.token)) {
+                closeDisabledApplication(runtime)
+                return false
             }
             if (!invokeApplication(runtime, "surface") {
                     callback.onSurfaceChanged(ArcMenuSurfaceEvent(runtime.context.surface(), true))
@@ -1319,6 +1327,10 @@ class MenuSessions(
             closeApplications(runtime.registration.owner)
             return
         }
+        if (!applicationRegistry.contains(runtime.registration.token)) {
+            closeDisabledApplication(runtime)
+            return
+        }
         runtime.ticks++
         if (player.isDead) return
         val position = vec(player.location.toVector())
@@ -1417,14 +1429,21 @@ class MenuSessions(
         applicationSessions.values.filter { it.registration.owner === owner }.toList().forEach(::closeDisabledApplication)
     }
 
-    fun closeApplicationRegistration(token: UUID) {
+    /**
+     * Closes sessions of registrations that were already removed from the registry, so no
+     * region thread can open a new session of them while this fan-out is in flight.
+     */
+    internal fun closeApplicationRegistrations(removed: Collection<RegisteredApplication>) {
+        if (removed.isEmpty()) return
+        val tokens = removed.mapTo(hashSetOf()) { it.token }
+        val ids = removed.mapTo(hashSetOf()) { it.id }
         history.values.forEach { stack ->
             stack.removeIf { route ->
-                route is ApplicationRoute && applicationRegistry.get(route.applicationId)?.token == token
+                route is ApplicationRoute && route.applicationId in ids && applicationRegistry.get(route.applicationId) == null
             }
         }
         history.entries.removeIf { it.value.isEmpty() }
-        applicationSessions.values.filter { it.registration.token == token }.toList().forEach(::closeDisabledApplication)
+        applicationSessions.values.filter { it.registration.token in tokens }.toList().forEach(::closeDisabledApplication)
     }
 
     /** Closes a disabled application on the thread that owns its player, then reopens the previous route. */
@@ -1524,23 +1543,35 @@ class MenuSessions(
         session.lastAnimation = tick.snapshot
     }
 
-    /** Closes every open menu; each player's entities are released on that player's own thread. */
+    /**
+     * Closes every menu open at the moment of the call; each player's entities are released on
+     * that player's own thread. A menu opened after the call (for example from the catalog that a
+     * reload has just published) is left alone.
+     */
     fun closeMenus() {
         val players = linkedMapOf<UUID, Player>()
-        applicationSessions.values.forEach { players[it.player.uniqueId] = it.player }
-        sessions.values.forEach { players[it.player.uniqueId] = it.player }
-        players.values.forEach { player -> onPlayerThread(player) { closeMenusFor(player) } }
+        val openApplications = HashMap(applicationSessions)
+        val openSessions = HashMap(sessions)
+        openApplications.values.forEach { players[it.player.uniqueId] = it.player }
+        openSessions.values.forEach { players[it.player.uniqueId] = it.player }
+        players.values.forEach { player ->
+            val id = player.uniqueId
+            onPlayerThread(player) { closeMenusFor(player, openSessions[id], openApplications[id]) }
+        }
     }
 
-    private fun closeMenusFor(player: Player) {
+    private fun closeMenusFor(player: Player, expectedSession: Session?, expectedApplication: HostedApplication?) {
         val id = player.uniqueId
-        if (applicationSessions.containsKey(id)) removeApplication(player, ArcMenuApplicationCloseReason.PLUGIN_DISABLE)
-        sessions.remove(id)?.let { session ->
-            closeArcitx(session)
-            if (session.pointerMode == PointerMode.MOUSE) pointer.end(session.player)
-            ArcScheduler.remove(plugin, session.capture)
-            session.view.close()
+        if (expectedApplication != null && applicationSessions[id] === expectedApplication) {
+            removeApplication(player, ArcMenuApplicationCloseReason.PLUGIN_DISABLE)
         }
+        if (expectedSession != null && sessions.remove(id, expectedSession)) {
+            closeArcitx(expectedSession)
+            if (expectedSession.pointerMode == PointerMode.MOUSE) pointer.end(expectedSession.player)
+            ArcScheduler.remove(plugin, expectedSession.capture)
+            expectedSession.view.close()
+        }
+        if (sessions.containsKey(id) || applicationSessions.containsKey(id)) return
         history.remove(id)
         lastActivation.remove(id)
         routeDepth.remove(id)
