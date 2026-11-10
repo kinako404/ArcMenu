@@ -4,6 +4,7 @@ import com.fentai.arcmenu.api.ArcMenuApi
 import com.fentai.arcmenu.api.ArcMenuRoute
 import com.fentai.arcmenu.core.config.AnimationCatalog
 import com.fentai.arcmenu.core.config.MenuCatalog
+import com.fentai.arcmenu.core.config.MenuEntrypointCompiler
 import com.fentai.arcmenu.core.config.MenuSetValidator
 import com.fentai.arcmenu.core.config.TemplateCatalog
 import com.fentai.arcmenu.core.config.LoadResult
@@ -18,6 +19,7 @@ import com.fentai.arcmenu.paper.branding.StartupBanner
 import com.fentai.arcmenu.paper.localization.ArcMessages
 import com.fentai.arcmenu.paper.localization.LanguageManager
 import com.fentai.arcmenu.paper.performance.PerformanceMetrics
+import com.fentai.arcmenu.paper.platform.ArcFileChannel
 import com.fentai.arcmenu.paper.platform.ArcScheduler
 import com.fentai.arcmenu.paper.editor.EditorService
 import com.fentai.arcmenu.paper.render.BukkitMenuRenderer
@@ -60,8 +62,8 @@ import com.fentai.arcmenu.paper.runtime.BundledMenuDefaults
 import java.nio.file.Files
 
 class ArcMenuPlugin : JavaPlugin(), Listener {
-    private var catalog = MenuCatalog()
-    private var animationCatalog = AnimationCatalog()
+    @Volatile private var catalog = MenuCatalog()
+    @Volatile private var animationCatalog = AnimationCatalog()
     private val templateCatalog = TemplateCatalog()
     private lateinit var renderer: BukkitMenuRenderer
     private lateinit var sessions: MenuSessions
@@ -78,14 +80,16 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     private lateinit var language: LanguageManager
     private var usageMetrics: Metrics? = null
     private lateinit var menuCommands: MenuCommandRegistry
-    private var shortcutSettings = MenuShortcutSettings()
-    private var initialCatalogPending = false
+    private lateinit var files: ArcFileChannel
+    @Volatile private var shortcutSettings = MenuShortcutSettings()
+    @Volatile private var initialCatalogPending = false
     private val menuDirectory get() = dataFolder.toPath().resolve("menus")
     private val templateDirectory get() = dataFolder.toPath().resolve("templates")
     private val animationFile get() = dataFolder.toPath().resolve("animations.yml")
 
     override fun onEnable() {
         StartupBanner.show(this)
+        files = ArcFileChannel(this)
         ConfigDefaults.load(this)
         shortcutSettings = MenuShortcutSettingsLoader.load(this)
         language = LanguageManager(this).also(LanguageManager::load)
@@ -128,7 +132,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         )
         if (result.applied) menuCommands.replace(catalog.documents)
         editor = EditorService(
-            this, menuDirectory, { catalog.documents }, sessions, renderer, this::applyEditorCatalog,
+            this, files, menuDirectory, { catalog.documents }, sessions, renderer, this::applyEditorCatalog,
             templateDirectory, { templateCatalog.templates }, { templateCatalog.reload(templateDirectory) }, language,
             {
                 resources.sources().sorted().mapNotNull { source ->
@@ -138,10 +142,10 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
                 }
             },
         )
-        workspace = WorkspaceService(this, editor, sessions, language, { catalog.documents },
+        workspace = WorkspaceService(this, files, editor, sessions, language, { catalog.documents },
             this::refreshWorkspaceFiles, { MarketConfiguration.url(config) }, { MarketConfiguration.certificateSha256(config) },
             { sender, key, arguments -> reply(sender, key, *arguments) }, resourcePending = { craftEngine.workspaceRefreshPending }, templates = { templateCatalog.templates })
-        api = ArcMenuApiImpl(sessions, extensionRoutes, applicationRegistry, pointer)
+        api = ArcMenuApiImpl(this, sessions, extensionRoutes, applicationRegistry, pointer)
         server.servicesManager.register(ArcMenuApi::class.java, api, this, ServicePriority.Normal)
         api.registerRoute(this, "arcmenu:example-details", ArcMenuRoute { player, arguments ->
             api.open(player, "details", arguments)
@@ -166,6 +170,7 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     override fun onDisable() {
         usageMetrics?.shutdown()
         usageMetrics = null
+        if (::files.isInitialized) files.close()
         if (::menuCommands.isInitialized) menuCommands.close()
         if (::workspace.isInitialized) workspace.close()
         if (::editor.isInitialized) editor.close()
@@ -270,81 +275,15 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
             "validate", "reload" -> {
                 val reload = args[0].equals("reload", true)
                 val reloadAll = reload && args.getOrNull(1).equals("all", true)
-                val tooltipStyle = try {
-                    TooltipStyleLoader.load(this)
-                } catch (error: Exception) {
-                    reply(sender, "command.reload.tooltip-invalid", error.message.orEmpty())
-                    return true
-                }
-                val (pointerSettings, runtimeScreenSettings, nextShortcutSettings) = try {
-                    ConfigDefaults.load(this)
-                    val nextPointer = PointerSettingsLoader.load(this)
-                    val nextScreen = RuntimeScreenSettingsLoader.load(this)
-                    val nextShortcuts = MenuShortcutSettingsLoader.load(this)
-                    language.load()
-                    configureMetrics()
-                    Triple(nextPointer, nextScreen, nextShortcuts)
-                } catch (error: Exception) {
-                    reply(sender, "command.reload.config-invalid", error.message.orEmpty())
-                    return true
-                }
-                if (reloadAll) try {
-                    resources.rebuild(tooltipStyle.nineSliceRequests())
-                } catch (error: Exception) {
-                    reply(sender, "command.reload.resource-failed", error.message.orEmpty())
-                    return true
-                }
-                if (!reloadAll && !resources.hasNineSlices(tooltipStyle.nineSliceRequests())) {
-                    reply(sender, "command.reload.tooltip-unbuilt")
-                    return true
-                }
-                val templateCheck = if (reloadAll || !reload) TemplateCatalog().reload(templateDirectory) else null
-                if (templateCheck != null && !templateCheck.applied) {
-                    reply(sender, "command.reload.template-invalid")
-                    templateCheck.errors.forEach { replyText(sender, it) }
-                    return true
-                }
-                val candidateCatalog = MenuCatalog()
-                val result = candidateCatalog.reload(menuDirectory, renderer::validate, this::validateMenuSet)
-                val candidateAnimations = AnimationCatalog()
-                val animationCheck = if (result.applied) candidateAnimations.reload(animationFile, candidateCatalog.documents) else null
-                if (animationCheck != null && !animationCheck.applied) {
-                    reply(sender, "command.reload.animation-invalid")
-                    animationCheck.errors.forEach { replyText(sender, it) }
-                    return true
-                }
-                if (result.applied) {
-                    if (reloadAll) templateCatalog.reload(templateDirectory)
-                    if (reload) {
-                        menuCommands.replace(candidateCatalog.documents)
-                        catalog = candidateCatalog
-                        animationCatalog = candidateAnimations
-                        sessions.closeMenus()
-                        sessions.updateTooltipStyle(tooltipStyle)
-                        sessions.updateRuntimeScreen(runtimeScreenSettings)
-                        pointer.updateSettings(pointerSettings)
-                        shortcutSettings = nextShortcutSettings
-                    }
-                    val animationCount = animationCheck?.tracks ?: 0
-                    if (reload) {
-                        val resourceSummary = if (reloadAll) language.text(sender, "command.reload.resources",
-                            resources.imageCount(), templateCatalog.templates.size) else ""
-                        val ceHint = if (reloadAll) language.text(sender, "command.reload.ce-hint") else ""
-                        reply(sender, "command.reload.loaded", result.count, animationCount, resourceSummary, ceHint)
-                    } else reply(sender, "command.reload.validated", result.count, animationCount,
-                        templateCheck?.count ?: templateCatalog.templates.size)
-                } else {
-                    reply(sender, "command.reload.validation-failed")
-                    result.errors.forEach { replyText(sender, it) }
-                }
+                fileCommand(sender) { reloadCatalog(sender, reload, reloadAll) }
             }
-            "resources", "resourcepack" -> {
+            "resources", "resourcepack" -> fileCommand(sender) {
                 try {
                     val result = resources.rebuild()
                     catalog.documents.values.forEach(renderer::validate)
-                    reply(sender, "command.resources.built", result.images, result.zip)
+                    listOf(language.text(sender, "command.resources.built", result.images, result.zip))
                 } catch (error: Exception) {
-                    reply(sender, "command.resources.failed", error.message.orEmpty())
+                    listOf(language.text(sender, "command.resources.failed", error.message.orEmpty()))
                 }
             }
             "preview" -> {
@@ -504,16 +443,114 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
     private fun modeName(sender: CommandSender, mode: PointerMode): String =
         language.text(sender, if (mode == PointerMode.MOUSE) "mode.mouse" else "mode.touch")
 
+    /**
+     * Runs a data-folder command on the file channel and replies on the sender's thread
+     * (the player's region, or the global region for the console).
+     */
+    private fun fileCommand(sender: CommandSender, work: () -> List<String>) {
+        files.submit(work).whenComplete { lines, error ->
+            val messages = lines ?: listOf(language.text(sender, "command.reload.validation-failed"),
+                (error?.cause ?: error)?.message.orEmpty())
+            val task = Runnable { messages.filter(String::isNotEmpty).forEach { replyText(sender, it) } }
+            if (sender is Player) ArcScheduler.execute(this, sender, task) else ArcScheduler.global(this, task)
+        }
+    }
+
+    /** File channel: load and validate everything, then publish once on the global region. */
+    private fun reloadCatalog(sender: CommandSender, reload: Boolean, reloadAll: Boolean): List<String> {
+        val out = mutableListOf<String>()
+        fun say(key: String, vararg arguments: Any?) { out += language.text(sender, key, *arguments) }
+        val tooltipStyle = try {
+            TooltipStyleLoader.load(this)
+        } catch (error: Exception) {
+            say("command.reload.tooltip-invalid", error.message.orEmpty())
+            return out
+        }
+        val (pointerSettings, runtimeScreenSettings, nextShortcutSettings) = try {
+            ConfigDefaults.load(this)
+            val nextPointer = PointerSettingsLoader.load(this)
+            val nextScreen = RuntimeScreenSettingsLoader.load(this)
+            val nextShortcuts = MenuShortcutSettingsLoader.load(this)
+            language.load()
+            Triple(nextPointer, nextScreen, nextShortcuts)
+        } catch (error: Exception) {
+            say("command.reload.config-invalid", error.message.orEmpty())
+            return out
+        }
+        if (reloadAll) try {
+            resources.rebuild(tooltipStyle.nineSliceRequests())
+        } catch (error: Exception) {
+            say("command.reload.resource-failed", error.message.orEmpty())
+            return out
+        }
+        if (!reloadAll && !resources.hasNineSlices(tooltipStyle.nineSliceRequests())) {
+            say("command.reload.tooltip-unbuilt")
+            return out
+        }
+        val templateCheck = if (reloadAll || !reload) TemplateCatalog().reload(templateDirectory) else null
+        if (templateCheck != null && !templateCheck.applied) {
+            say("command.reload.template-invalid")
+            out += templateCheck.errors
+            return out
+        }
+        val candidateCatalog = MenuCatalog()
+        val result = candidateCatalog.reload(menuDirectory, renderer::validate, this::validateMenuSetOffThread)
+        val candidateAnimations = AnimationCatalog()
+        val animationCheck = if (result.applied) candidateAnimations.reload(animationFile, candidateCatalog.documents) else null
+        if (animationCheck != null && !animationCheck.applied) {
+            say("command.reload.animation-invalid")
+            out += animationCheck.errors
+            return out
+        }
+        if (!result.applied) {
+            say("command.reload.validation-failed")
+            out += result.errors
+            return out
+        }
+        if (reloadAll) templateCatalog.reload(templateDirectory)
+        try {
+            files.onGlobal {
+                if (reload) {
+                    menuCommands.replace(candidateCatalog.documents)
+                    catalog = candidateCatalog
+                    animationCatalog = candidateAnimations
+                    sessions.closeMenus()
+                    sessions.updateTooltipStyle(tooltipStyle)
+                    sessions.updateRuntimeScreen(runtimeScreenSettings)
+                    pointer.updateSettings(pointerSettings)
+                    shortcutSettings = nextShortcutSettings
+                } else menuCommands.validate(candidateCatalog.documents)
+                configureMetrics()
+            }
+        } catch (error: Exception) {
+            say("command.reload.validation-failed")
+            out += error.message.orEmpty()
+            return out
+        }
+        val animationCount = animationCheck?.tracks ?: 0
+        if (reload) {
+            val resourceSummary = if (reloadAll) language.text(sender, "command.reload.resources",
+                resources.imageCount(), templateCatalog.templates.size) else ""
+            val ceHint = if (reloadAll) language.text(sender, "command.reload.ce-hint") else ""
+            say("command.reload.loaded", result.count, animationCount, resourceSummary, ceHint)
+        } else say("command.reload.validated", result.count, animationCount,
+            templateCheck?.count ?: templateCatalog.templates.size)
+        return out
+    }
+
+    /** File channel: parse and validate the menu folder, then publish it on the global region. */
     private fun applyEditorCatalog(): LoadResult {
         val candidate = MenuCatalog()
-        val menus = candidate.reload(menuDirectory, renderer::validate, this::validateMenuSet)
+        val menus = candidate.reload(menuDirectory, renderer::validate, this::validateMenuSetOffThread)
         if (!menus.applied) return menus
         val animations = AnimationCatalog()
         val animationResult = animations.reload(animationFile, candidate.documents)
         if (!animationResult.applied) return LoadResult(false, catalog.documents.size, animationResult.errors)
-        menuCommands.replace(candidate.documents)
-        catalog = candidate
-        animationCatalog = animations
+        files.onGlobal {
+            menuCommands.replace(candidate.documents)
+            catalog = candidate
+            animationCatalog = animations
+        }
         return menus
     }
 
@@ -531,11 +568,19 @@ class ArcMenuPlugin : JavaPlugin(), Listener {
         menuCommands.validate(documents)
     }
 
+    /** Command-map conflicts are checked again where commands are published, on the global region. */
+    private fun validateMenuSetOffThread(documents: Map<String, MenuDocument>) {
+        MenuSetValidator.validate(documents)
+        MenuEntrypointCompiler.compile(documents)
+    }
+
     private fun onCraftEngineReloadReady(firstReload: Boolean) {
         if (!initialCatalogPending || !::renderer.isInitialized) return
-        val result = applyEditorCatalog()
-        if (!result.applied) return
-        initialCatalogPending = false
-
+        files.submit {
+            if (initialCatalogPending && applyEditorCatalog().applied) initialCatalogPending = false
+        }.exceptionally { error ->
+            logger.warning(language.log("log.resource-initial-failed", (error.cause ?: error).message.orEmpty()))
+            null
+        }
     }
 }

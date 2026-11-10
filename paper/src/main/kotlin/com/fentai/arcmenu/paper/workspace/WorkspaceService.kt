@@ -12,7 +12,9 @@ import com.fentai.arcmenu.paper.localization.localizedStateFailure
 import com.fentai.arcmenu.paper.pack.ArcPackService
 import com.fentai.arcmenu.paper.pack.LocalArcPack
 import com.fentai.arcmenu.paper.pack.ArcPackPreviewScene
+import com.fentai.arcmenu.paper.platform.ArcFileChannel
 import com.fentai.arcmenu.paper.platform.ArcScheduler
+import com.fentai.arcmenu.core.model.MenuDefinition
 import com.fentai.arcmenu.paper.runtime.MenuSessions
 import com.fentai.arcmenu.protocol.EditorProtocol
 import com.fentai.arcmenu.protocol.WorkspaceProtocol
@@ -33,8 +35,14 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.imageio.ImageIO
 import kotlin.math.tan
 
+/**
+ * Workspace requests arrive on the player's thread. Every data-folder transaction (and the catalog
+ * refresh it triggers) runs on the shared [ArcFileChannel], network transfers on [worker], and
+ * replies go back to the player's thread; no tick thread waits for a file lock.
+ */
 internal class WorkspaceService(
     private val plugin: Plugin,
+    private val files: ArcFileChannel,
     private val editor: EditorService,
     private val sessions: MenuSessions,
     private val language: LanguageManager,
@@ -48,7 +56,6 @@ internal class WorkspaceService(
 ) : PluginMessageListener, AutoCloseable {
     private val root = plugin.dataFolder.toPath().toAbsolutePath().normalize()
     private val json = Gson()
-    private val fileLock = Any()
     private val projects = WorkspaceProjects(root, documents, refresh, ::isEditing, templates)
     private val packs = ArcPackService(root, { documents().values }, refresh, templates)
     private val gateway = MarketGateway(marketUrl, marketCertificate, root.resolve("packs/.downloads"))
@@ -70,9 +77,12 @@ internal class WorkspaceService(
         localizedRequire(player.listeningPluginChannels.contains(WorkspaceProtocol.CHANNEL), "workspace.editor-required", "Install the current ArcMenu Editor to open this workspace")
         if (view == "market") requireMarketOperator(player)
         else localizedRequire(player.hasPermission("arcmenu.admin"), "workspace.permission-required", "Workspace permission is required")
-        val content = if (player.hasPermission("arcmenu.admin")) listing(player) else linkedMapOf<String, Any>("marketUrl" to marketUrl(), "marketCertificateSha256" to marketCertificate(), "capabilities" to capabilities(player))
-        content["view"] = view
-        reply(player, 0, "show", content)
+        if (!player.hasPermission("arcmenu.admin")) {
+            reply(player, 0, "show", linkedMapOf<String, Any>("marketUrl" to marketUrl(), "marketCertificateSha256" to marketCertificate(),
+                "capabilities" to capabilities(player), "view" to view))
+            return
+        }
+        fileAsync(player, 0, "show", ::listingFiles) { content -> reply(player, 0, "show", listing(player, content).apply { put("view", view) }) }
     }
     private fun capabilities(player: Player): Map<String, Boolean> = mapOf(
         "effects" to false, "shaders" to false, "gifs" to true,
@@ -83,10 +93,16 @@ internal class WorkspaceService(
             "workspace.market-op-required", "Only operators may use the marketplace")
     }
 
-    private fun listing(player: Player): LinkedHashMap<String, Any> = synchronized(fileLock) {
+    /** File channel. */
+    private fun listingFiles(): LinkedHashMap<String, Any> =
         linkedMapOf("projects" to projects.list(), "packs" to packs.list().map {
             mapOf("id" to it.manifest.id, "title" to it.manifest.title, "version" to it.manifest.version)
-        }, "localPacks" to packs.listExports().map(::localPack), "marketUrl" to marketUrl(), "marketCertificateSha256" to marketCertificate(), "resourcePending" to resourcePending(), "capabilities" to capabilities(player))
+        }, "localPacks" to packs.listExports().map(::localPack))
+
+    /** Player thread. */
+    private fun listing(player: Player, files: LinkedHashMap<String, Any>): LinkedHashMap<String, Any> = files.apply {
+        put("marketUrl", marketUrl()); put("marketCertificateSha256", marketCertificate())
+        put("resourcePending", resourcePending()); put("capabilities", capabilities(player))
     }
     private fun localPack(pack: LocalArcPack): Map<String, Any> = linkedMapOf(
         "filename" to pack.filename, "id" to pack.manifest.id, "version" to pack.manifest.version,
@@ -121,7 +137,7 @@ internal class WorkspaceService(
     private fun handle(player: Player, packet: WorkspaceProtocol.Request, args: JsonObject) {
         val requestId = packet.requestId(); val action = packet.action()
         when (action) {
-            "list" -> reply(player, requestId, action, listing(player))
+            "list" -> fileAsync(player, packet, ::listingFiles) { reply(player, requestId, action, listing(player, it)) }
             "open" -> {
                 val selected = selection(args)
                 localizedRequire(selected.type != "template", "workspace.template-preview-only", "View templates with a read-only preview")
@@ -131,18 +147,22 @@ internal class WorkspaceService(
                 editor.open(player, selected.id)
                 reply(player, requestId, action, mapOf("type" to selected.type, "id" to selected.id))
             }
-            "create", "configure", "delete" -> synchronized(fileLock) {
-                when (action) {
-                    "create" -> projects.create(args)
-                    "configure" -> projects.configure(args)
-                    else -> {
-                        localizedRequire(args.get("confirm")?.asBoolean == true, "workspace.delete-confirmation", "Confirm the selected projects before deleting")
-                        val selected = selections(args)
-                        projects.delete(selected)
-                        if (selected.any { it.type == "template" }) editor.refreshSnapshot(player)
+            "create", "configure", "delete" -> {
+                val selected = if (action == "delete") {
+                    localizedRequire(args.get("confirm")?.asBoolean == true, "workspace.delete-confirmation", "Confirm the selected projects before deleting")
+                    selections(args)
+                } else emptyList()
+                fileAsync(player, packet, {
+                    when (action) {
+                        "create" -> projects.create(args)
+                        "configure" -> projects.configure(args)
+                        else -> projects.delete(selected)
                     }
+                    listingFiles()
+                }) { content ->
+                    if (selected.any { it.type == "template" }) editor.refreshSnapshot(player)
+                    reply(player, requestId, action, listing(player, content))
                 }
-                reply(player, requestId, action, listing(player))
             }
             "export" -> {
                 val selections = selections(args)
@@ -151,73 +171,78 @@ internal class WorkspaceService(
                     args.string("description"), ArcPackAuthor(args.string("authorUuid", player.uniqueId.toString()), args.string("authorName", player.name)),
                     selections.map { ArcPackSelection(it.type, it.id) },
                     args.getAsJsonArray("dependencies")?.map { it.asString }.orEmpty(), args.get("allowCe")?.asBoolean == true)
-                async(player, packet, { synchronized(fileLock) { packs.export(request) } }) { result ->
+                fileAsync(player, packet, {
+                    val result = packs.export(request)
+                    val exports = packs.listExports()
+                    Triple(result, exports.map(::localPack), localPack(exports.first { it.filename == result.archive.fileName.toString() }))
+                }) { (result, localPacks, localPack) ->
                     reply(player, requestId, action, mapOf("filename" to result.archive.fileName.toString(), "manifest" to result.manifest,
                         "warnings" to result.warnings, "dependencies" to result.manifest.dependencies,
-                        "localPacks" to packs.listExports().map(::localPack),
-                        "localPack" to localPack(packs.listExports().first { it.filename == result.archive.fileName.toString() })))
+                        "localPacks" to localPacks, "localPack" to localPack))
                 }
             }
-            "pack-configure" -> async(player, packet, { synchronized(fileLock) {
+            "pack-configure" -> fileAsync(player, packet, {
                 packs.configureExport(args.required("filename"), args.required("title"), args.required("description"))
-            } }) { reply(player, requestId, action, listing(player)) }
+                listingFiles()
+            }) { reply(player, requestId, action, listing(player, it)) }
             "pack-delete" -> {
                 localizedRequire(args.get("confirm")?.asBoolean == true, "workspace.pack-delete-confirmation", "Confirm the selected packages before deleting")
                 val names = args.getAsJsonArray("filenames")?.map { it.asString } ?: localizedError("workspace.pack-selection-required", "Select package files before deleting")
-                async(player, packet, { synchronized(fileLock) { packs.deleteExports(names) } }) { backups ->
-                    reply(player, requestId, action, listing(player).apply { put("backups", backups) })
+                fileAsync(player, packet, { packs.deleteExports(names) to listingFiles() }) { (backups, content) ->
+                    reply(player, requestId, action, listing(player, content).apply { put("backups", backups) })
                 }
             }
-            "pack-preview" -> async(player, packet, { synchronized(fileLock) { packs.previewThumbnail(args.required("filename"), args.required("name")) } }) { bytes ->
+            "pack-preview" -> fileAsync(player, packet, { packs.previewThumbnail(args.required("filename"), args.required("name")) }) { bytes ->
                 reply(player, requestId, action, mapOf("filename" to args.required("filename"), "name" to args.required("name"),
                     "width" to 320, "height" to 180, "data" to Base64.getEncoder().encodeToString(bytes)))
             }
-            "pack-prepare" -> async(player, packet, { synchronized(fileLock) {
+            "pack-prepare" -> fileAsync(player, packet, {
                 val filename = args.required("filename")
                 packs.attachExportPreviews(filename, stagedPreviews(player.uniqueId, filename))
                 ArcPackIO.inspect(exportFile(filename)).projects.forEach { project ->
                     Files.deleteIfExists(previewDirectory(player.uniqueId, filename).resolve("${project.type}-${project.id}.png"))
                 }
-                filename
-            } }) { filename -> reply(player, requestId, action, listing(player).apply {
-                put("localPack", localPack(packs.listExports().first { it.filename == filename }))
-            }) }
-            "install" -> async(player, packet, { gateway.download(args.required("id"), args.string("version"), args.string("token")) }) { file ->
-                try {
-                    val result = synchronized(fileLock) { packs.install(file) }
-                    if (result.pack.manifest.projects.any { it.type == "template" }) editor.refreshSnapshot(player)
-                    reply(player, requestId, action, listing(player).apply { put("installed", result.pack.manifest.id); put("warnings", result.warnings) })
-                } finally { Files.deleteIfExists(file) }
-            }
-            "import" -> synchronized(fileLock) {
-                val result = packs.install(exportFile(args.required("filename")))
+                listingFiles().apply { put("localPack", localPack(packs.listExports().first { it.filename == filename })) }
+            }) { content -> reply(player, requestId, action, listing(player, content)) }
+            "install" -> async(player, packet, {
+                val file = gateway.download(args.required("id"), args.string("version"), args.string("token"))
+                try { files.call { packs.install(file) to listingFiles() } } finally { Files.deleteIfExists(file) }
+            }) { (result, content) ->
                 if (result.pack.manifest.projects.any { it.type == "template" }) editor.refreshSnapshot(player)
-                reply(player, requestId, action, listing(player).apply { put("installed", result.pack.manifest.id); put("warnings", result.warnings) })
+                reply(player, requestId, action, listing(player, content).apply { put("installed", result.pack.manifest.id); put("warnings", result.warnings) })
             }
-            "uninstall" -> synchronized(fileLock) {
+            "import" -> fileAsync(player, packet, { packs.install(exportFile(args.required("filename"))) to listingFiles() }) { (result, content) ->
+                if (result.pack.manifest.projects.any { it.type == "template" }) editor.refreshSnapshot(player)
+                reply(player, requestId, action, listing(player, content).apply { put("installed", result.pack.manifest.id); put("warnings", result.warnings) })
+            }
+            "uninstall" -> {
                 val id = args.required("id")
-                val installed = packs.list().firstOrNull { it.manifest.id == id } ?: localizedError("workspace.pack-not-installed", "Package is not installed: $id", id)
-                installed.manifest.projects.forEach { project -> localizedRequire(!isEditing(WorkspaceSelection(project.type, project.id)), "workspace.uninstall-close-required", "Close all editors for this package before uninstalling") }
-                val result = packs.uninstall(id)
-                if (installed.manifest.projects.any { it.type == "template" }) editor.refreshSnapshot(player)
-                reply(player, requestId, action, listing(player).apply { put("uninstalled", id); put("warnings", result.warnings); put("backups", result.backups.map(Path::toString)) })
+                fileAsync(player, packet, {
+                    val installed = packs.list().firstOrNull { it.manifest.id == id } ?: localizedError("workspace.pack-not-installed", "Package is not installed: $id", id)
+                    installed.manifest.projects.forEach { project -> localizedRequire(!isEditing(WorkspaceSelection(project.type, project.id)), "workspace.uninstall-close-required", "Close all editors for this package before uninstalling") }
+                    Triple(installed, packs.uninstall(id), listingFiles())
+                }) { (installed, result, content) ->
+                    if (installed.manifest.projects.any { it.type == "template" }) editor.refreshSnapshot(player)
+                    reply(player, requestId, action, listing(player, content).apply { put("uninstalled", id); put("warnings", result.warnings); put("backups", result.backups.map(Path::toString)) })
+                }
             }
             "preview-open" -> {
                 val selected = selection(args); val frame = args.get("frame")?.asDouble
                 val filename = args.string("filename")
-                if (filename.isBlank()) openCapture(player, packet, selected, frame)
-                else async(player, packet, { synchronized(fileLock) { packs.previewExport(filename, ArcPackSelection(selected.type, selected.id), frame) } }) { bundled ->
-                    openCapture(player, packet, selected, frame, bundled)
+                if (filename.isBlank()) fileAsync(player, packet, { projects.previewScene(selected) }) { scene ->
+                    openCapture(player, packet, selected, frame, scene)
+                }
+                else fileAsync(player, packet, { packs.previewExport(filename, ArcPackSelection(selected.type, selected.id), frame) }) { bundled ->
+                    openCapture(player, packet, selected, frame, bundled.scene)
                 }
             }
             "preview-restore" -> { restoreCapture(player); reply(player, requestId, action, mapOf("restored" to true)) }
-            "preview-chunk" -> {
-                previewChunk(player, args)
+            "preview-chunk" -> fileAsync(player, packet, { previewChunk(player.uniqueId, args) }) {
                 reply(player, requestId, action, mapOf("index" to args.get("index").asInt))
             }
             "publish" -> {
                 async(player, packet, {
-                    val file = synchronized(fileLock) { publication(args) }
+                    val file = files.call { publication(args) }
                     try { gateway.publish(file, ArcPackIO.inspect(file).id, args.required("token")) } finally { Files.deleteIfExists(file) }
                 }) {
                     reply(player, requestId, action, it)
@@ -237,23 +262,35 @@ internal class WorkspaceService(
         localizedRequire(it.isNotEmpty() && it.size <= 512 && it.distinct().size == it.size, "workspace.project-selection-count", "Select between 1 and 512 different projects")
     }
     private fun exportFile(name: String): Path = packs.exportedFile(name)
+    /** Network work on [worker]; the result is handled on the player's thread. */
     private fun <T> async(player: Player, packet: WorkspaceProtocol.Request, work: () -> T, complete: (T) -> Unit) {
-        worker.execute {
-            try {
-                val result = work()
-                if (!plugin.isEnabled || !player.isOnline) { if (result is Path) Files.deleteIfExists(result); return@execute }
-                ArcScheduler.execute(plugin, player, Runnable {
-                    try {
-                        localizedRequire(player.hasPermission("arcmenu.admin"), "workspace.permission-revoked", "Administrator permission was revoked")
-                        complete(result)
-                    } catch (error: Exception) { failure(player, packet.requestId(), packet.action(), error) }
-                })
-            } catch (error: Exception) { if (plugin.isEnabled) ArcScheduler.execute(plugin, player, Runnable { failure(player, packet.requestId(), packet.action(), error) }) }
+        worker.execute { finish(player, packet.requestId(), packet.action(), runCatching(work), complete) }
+    }
+
+    /** Data-folder work on the file channel, queued behind every other file operation. */
+    private fun <T> fileAsync(player: Player, packet: WorkspaceProtocol.Request, work: () -> T, complete: (T) -> Unit) =
+        fileAsync(player, packet.requestId(), packet.action(), work, complete)
+
+    private fun <T> fileAsync(player: Player, requestId: Long, action: String, work: () -> T, complete: (T) -> Unit) {
+        files.submit(work).whenComplete { result, error ->
+            finish(player, requestId, action, if (error == null) Result.success(result) else Result.failure(error.cause ?: error), complete)
         }
     }
-    private fun openCapture(player: Player, packet: WorkspaceProtocol.Request, selected: WorkspaceSelection, requestedFrame: Double?, bundled: ArcPackPreviewScene? = null) {
+
+    private fun <T> finish(player: Player, requestId: Long, action: String, outcome: Result<T>, complete: (T) -> Unit) {
+        val task = Runnable {
+            try {
+                val result = outcome.getOrElse { throw it as? Exception ?: RuntimeException(it) }
+                localizedRequire(player.hasPermission("arcmenu.admin"), "workspace.permission-revoked", "Administrator permission was revoked")
+                complete(result)
+            } catch (error: Exception) { failure(player, requestId, action, error) }
+        }
+        val delivered = plugin.isEnabled && player.isOnline && ArcScheduler.execute(plugin, player, task)
+        if (!delivered) (outcome.getOrNull() as? Path)?.let { runCatching { Files.deleteIfExists(it) } }
+    }
+
+    private fun openCapture(player: Player, packet: WorkspaceProtocol.Request, selected: WorkspaceSelection, requestedFrame: Double?, scene: MenuDefinition) {
         val frame = 0.0
-        val scene = bundled?.scene ?: projects.previewScene(selected)
         if (!captures.containsKey(player.uniqueId)) captures[player.uniqueId] = Capture(selected)
         else captures.getValue(player.uniqueId).project = selected
         val canvas = scene.canvas
@@ -284,16 +321,16 @@ internal class WorkspaceService(
         if (editor.contains(player)) { editor.restorePreview(player) }
         else sessions.close(player, true)
     }
-    private fun previewDirectory(player: Player, filename: String): Path = previewDirectory(player.uniqueId, filename)
     private fun previewDirectory(uuid: UUID, filename: String): Path = root.resolve("packs/.previews").resolve(uuid.toString()).resolve(filename)
-    private fun previewChunk(player: Player, args: JsonObject) {
+    /** File channel; chunks of one player keep their arrival order on the single channel thread. */
+    private fun previewChunk(player: UUID, args: JsonObject) {
         val filename = args.required("filename"); val archive = exportFile(filename)
         val name = args.required("name")
         val index = args.get("index").asInt; val count = args.get("count").asInt
         localizedRequire(index >= 0 && index < count && count in 1..512, "workspace.preview-chunk-invalid", "Invalid preview chunk index")
         val encoded = args.required("data"); localizedRequire(encoded.length <= 20_000, "workspace.preview-chunk-too-large", "Preview chunk is too large")
         val bytes = Base64.getDecoder().decode(encoded); localizedRequire(bytes.isNotEmpty(), "workspace.preview-chunk-empty", "Empty preview chunk")
-        val key = "${player.uniqueId}/$filename/$name"
+        val key = "$player/$filename/$name"
         if (index == 0) {
             val manifest = ArcPackIO.inspect(archive)
             localizedRequire(manifest.projects.any { name == "${it.type}-${it.id}.png" }, "workspace.preview-name-invalid", "Preview name must identify an exported project")
@@ -338,22 +375,22 @@ internal class WorkspaceService(
         localizedRequire(sender.hasPermission("arcmenu.admin"), "workspace.admin-required", "Administrator permission is required")
         notify(sender, "workspace.downloading", arrayOf(id))
         worker.execute {
-            try {
+            val task = try {
                 val file = gateway.download(id, version)
-                val task = Runnable {
-                    try {
+                val result = try {
+                    files.call {
                         localizedRequire(sender.hasPermission("arcmenu.admin"), "workspace.permission-revoked", "Administrator permission was revoked")
-                        val result = synchronized(fileLock) { packs.install(file) }
-                        notify(sender, "workspace.installed", arrayOf(result.pack.manifest.id))
-                        if (resourcePending()) notify(sender, "workspace.resources-pending", emptyArray())
-                    } catch (error: Exception) { notify(sender, "workspace.failed", arrayOf(language.errorText(sender, error, "workspace.operation-failed"))) }
-                    finally { Files.deleteIfExists(file) }
+                        packs.install(file)
+                    }
+                } finally { Files.deleteIfExists(file) }
+                Runnable {
+                    notify(sender, "workspace.installed", arrayOf(result.pack.manifest.id))
+                    if (resourcePending()) notify(sender, "workspace.resources-pending", emptyArray())
                 }
-                if (sender is Player) ArcScheduler.execute(plugin, sender, task) else ArcScheduler.globalLater(plugin, task)
             } catch (error: Exception) {
-                val task = Runnable { notify(sender, "workspace.failed", arrayOf(language.errorText(sender, error, "workspace.operation-failed"))) }
-                if (sender is Player) ArcScheduler.execute(plugin, sender, task) else ArcScheduler.globalLater(plugin, task)
+                Runnable { notify(sender, "workspace.failed", arrayOf(language.errorText(sender, error, "workspace.operation-failed"))) }
             }
+            if (sender is Player) ArcScheduler.execute(plugin, sender, task) else ArcScheduler.global(plugin, task)
         }
     }
     private fun reply(player: Player, id: Long, action: String, value: Any) = send(player, WorkspaceProtocol.Reply(id, true, action, json.toJson(value), ""))

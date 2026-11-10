@@ -33,6 +33,35 @@ class ApplicationRegistryTest {
     }
 
     @Test
+    fun `token unregistration hands the removed registration to exactly one caller`() {
+        val registry = ApplicationRegistry()
+        val owner = plugin("Owner")
+        val registration = registry.register(owner, "owner:shop", ArcMenuApplicationOptions.DEFAULT, ArcMenuApplication { error("unused") })
+
+        assertEquals(registration, registry.unregister(registration.token))
+        assertFalse(registry.contains(registration.token))
+        assertEquals(null, registry.get("owner:shop"))
+        assertEquals(null, registry.unregister(registration.token))
+        assertEquals(emptyList<RegisteredApplication>(), registry.unregister(owner))
+    }
+
+    @Test
+    fun `owner unregistration removes token lookups and allows a fresh registration`() {
+        val registry = ApplicationRegistry()
+        val owner = plugin("Owner")
+        val first = registry.register(owner, "owner:shop", ArcMenuApplicationOptions.DEFAULT, ArcMenuApplication { error("unused") })
+        val removed = registry.unregister(owner)
+
+        assertEquals(listOf(first), removed)
+        assertFalse(registry.contains(first.token))
+        val second = registry.register(owner, "owner:shop", ArcMenuApplicationOptions.DEFAULT, ArcMenuApplication { error("unused") })
+        assertTrue(registry.contains(second.token))
+        assertFalse(registry.contains(first.token))
+        assertEquals(null, registry.unregister(first.token))
+        assertTrue(registry.contains(second.token))
+    }
+
+    @Test
     fun `invalid application options are rejected before publication`() {
         val registry = ApplicationRegistry()
         val options = ArcMenuApplicationOptions.builder().tickInterval(0).build()

@@ -16,6 +16,7 @@ import com.fentai.arcmenu.paper.localization.ArcMessages
 import com.fentai.arcmenu.paper.runtime.MenuSessions
 import com.fentai.arcmenu.paper.util.decimal
 import com.fentai.arcmenu.protocol.EditorProtocol
+import com.fentai.arcmenu.paper.platform.ArcFileChannel
 import com.fentai.arcmenu.paper.platform.ArcScheduler
 import org.bukkit.Bukkit
 import org.bukkit.entity.Player
@@ -24,7 +25,10 @@ import org.bukkit.plugin.messaging.PluginMessageListener
 import java.nio.file.Path
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import com.fentai.arcmenu.core.model.GroupNode
@@ -35,8 +39,14 @@ import org.yaml.snakeyaml.LoaderOptions
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.constructor.SafeConstructor
 
-class EditorService(
+/**
+ * Editor sessions keyed by player. Packets of one player are handled on that player's thread in
+ * arrival order; disk writes and catalog reloads run on the shared [ArcFileChannel], and packets
+ * that arrive meanwhile wait in the player's inbox so the draft is never touched concurrently.
+ */
+class EditorService internal constructor(
     private val plugin: Plugin,
+    private val files: ArcFileChannel,
     private val menuDirectory: Path,
     private val documents: () -> Map<String, MenuDocument>,
     private val sessions: MenuSessions,
@@ -49,22 +59,27 @@ class EditorService(
     private val images: () -> List<EditorProtocol.ImageSnapshot>,
 ) : PluginMessageListener, AutoCloseable {
     private data class Rate(var second: Long, var count: Int)
+    private class Inbox {
+        val queued = ArrayDeque<ByteArray>()
+        var busy = false
+    }
 
     private val parser = MenuParser()
-    private val drafts = mutableMapOf<UUID, EditorDraft>()
-    private val writers = mutableMapOf<String, UUID>()
-    private val clientVersions = mutableMapOf<UUID, String>()
-    private val rates = mutableMapOf<UUID, Rate>()
-    private val incomingFrames = mutableMapOf<UUID, EditorProtocol.FrameAssembler>()
+    private val drafts = ConcurrentHashMap<UUID, EditorDraft>()
+    private val writers = ConcurrentHashMap<String, UUID>()
+    private val clientVersions = ConcurrentHashMap<UUID, String>()
+    private val rates = ConcurrentHashMap<UUID, Rate>()
+    private val incomingFrames = ConcurrentHashMap<UUID, EditorProtocol.FrameAssembler>()
+    private val inboxes = ConcurrentHashMap<UUID, Inbox>()
     private val nextMessage = AtomicInteger(1)
-    private val writerKeys = mutableMapOf<UUID, String>()
 
     init {
         plugin.server.messenger.registerIncomingPluginChannel(plugin, EditorProtocol.CHANNEL, this)
         plugin.server.messenger.registerOutgoingPluginChannel(plugin, EditorProtocol.CHANNEL)
     }
 
-    @Synchronized fun open(player: Player, menuId: String): String {
+    /** Player thread. */
+    fun open(player: Player, menuId: String): String {
         require(player.listeningPluginChannels.contains(EditorProtocol.CHANNEL)) {
             text(player, "editor.no-channel")
         }
@@ -91,7 +106,8 @@ class EditorService(
         )
         // Validate the entire response before acquiring a writer or opening a preview.
         encode(snapshot(draft))
-        writers[menuId] = player.uniqueId
+        val holder = writers.putIfAbsent(menuId, player.uniqueId)
+        require(holder == null || holder == player.uniqueId) { text(player, "editor.writer-conflict", menuId) }
         drafts[player.uniqueId] = draft
         try {
             localizedRequire(sessions.openPreview(player, draft.definition, MenuViewMode.FRONTEND_PREVIEW) > 0,
@@ -106,13 +122,13 @@ class EditorService(
             clientVersions[player.uniqueId] ?: text(player, "editor.connected"))
     }
 
-    @Synchronized fun contains(player: Player): Boolean = drafts.containsKey(player.uniqueId)
-    @Synchronized fun hasUnsavedDraft(player: Player): Boolean = drafts[player.uniqueId]?.dirty == true
-    @Synchronized fun isEditing(menuId: String): Boolean = writers.containsKey(menuId)
-    @Synchronized internal fun refreshSnapshot(player: Player) {
+    fun contains(player: Player): Boolean = drafts.containsKey(player.uniqueId)
+    fun hasUnsavedDraft(player: Player): Boolean = drafts[player.uniqueId]?.dirty == true
+    fun isEditing(menuId: String): Boolean = writers.containsKey(menuId)
+    internal fun refreshSnapshot(player: Player) {
         drafts[player.uniqueId]?.let { sendSnapshot(player, it) }
     }
-    @Synchronized internal fun restorePreview(player: Player): Boolean {
+    internal fun restorePreview(player: Player): Boolean {
         val draft = drafts[player.uniqueId] ?: return false
         val definition = draft.definition
         val mode = if (draft.activeTab == EditorProtocol.TAB_BACKEND) MenuViewMode.BACKEND_PREVIEW else MenuViewMode.FRONTEND_PREVIEW
@@ -121,7 +137,8 @@ class EditorService(
         return true
     }
 
-    @Synchronized fun createMenu(player: Player, id: String, fromMenu: String? = null): String {
+    /** Player thread; the file is written on the file channel and the editor opens back on the player's thread. */
+    fun createMenu(player: Player, id: String, fromMenu: String? = null): CompletableFuture<String> {
         require(player.hasPermission("arcmenu.admin")) { text(player, "editor.permission-lost") }
         require(player.listeningPluginChannels.contains(EditorProtocol.CHANNEL) && EditorProtocol.supportsClient(clientVersions[player.uniqueId])) { text(player, "editor.update-required", EditorProtocol.EDITOR_VERSION) }
         localizedRequire(Regex("[a-z0-9][a-z0-9_-]{0,63}").matches(id), "editor.menu-id-invalid", "Menu ID must use lowercase letters, digits, underscores or hyphens")
@@ -134,37 +151,59 @@ class EditorService(
             yaml.dump(root)
         }
         renderer.validate(parser.parse(source, "$id.yml"))
-        Files.createDirectories(menuDirectory)
-        val file = menuDirectory.resolve("$id.yml")
-        Files.writeString(file, source, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
-        val loaded = applyCatalog()
-        if (!loaded.applied) {
-            Files.deleteIfExists(file)
-            localizedRequire(false, "editor.new-menu-invalid", "New menu could not be loaded: ${loaded.errors.joinToString("; ")}", loaded.errors.joinToString("; "))
+        val opened = CompletableFuture<String>()
+        files.submit {
+            Files.createDirectories(menuDirectory)
+            val file = menuDirectory.resolve("$id.yml")
+            Files.writeString(file, source, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+            val loaded = try { applyCatalog() } catch (error: Exception) { Files.deleteIfExists(file); throw error }
+            if (!loaded.applied) {
+                Files.deleteIfExists(file)
+                localizedRequire(false, "editor.new-menu-invalid", "New menu could not be loaded: ${loaded.errors.joinToString("; ")}", loaded.errors.joinToString("; "))
+            }
+        }.whenComplete { _, error ->
+            val resume = Runnable {
+                if (error != null) opened.completeExceptionally(error.cause ?: error)
+                else try { opened.complete(open(player, id)) } catch (failure: Exception) { opened.completeExceptionally(failure) }
+            }
+            if (!ArcScheduler.execute(plugin, player, resume)) opened.completeExceptionally(IllegalStateException(text(player, "editor.no-draft")))
         }
-        return open(player, id)
+        return opened
     }
 
-    @Synchronized fun disconnect(player: Player) {
+    /** Player thread. */
+    fun disconnect(player: Player) {
         close(player)
         clientVersions.remove(player.uniqueId)
         rates.remove(player.uniqueId)
         incomingFrames.remove(player.uniqueId)
+        inboxes.remove(player.uniqueId)
     }
 
-    @Synchronized fun close(player: Player) {
+    /** Player thread. */
+    fun close(player: Player) {
         val draft = drafts.remove(player.uniqueId) ?: return
-        writers.remove(writerKeys.remove(player.uniqueId) ?: draft.menuId, player.uniqueId)
+        writers.remove(draft.menuId, player.uniqueId)
         rates.remove(player.uniqueId)
         sessions.close(player, true)
     }
 
-    @Synchronized override fun onPluginMessageReceived(channel: String, player: Player, message: ByteArray) {
+    override fun onPluginMessageReceived(channel: String, player: Player, message: ByteArray) {
         if (channel != EditorProtocol.CHANNEL) return
         if (!ArcScheduler.owns(player)) {
             ArcScheduler.execute(plugin, player, Runnable { onPluginMessageReceived(channel, player, message) })
             return
         }
+        val inbox = inboxes.computeIfAbsent(player.uniqueId) { Inbox() }
+        if (inbox.busy) {
+            if (inbox.queued.size < MAX_QUEUED_MESSAGES) inbox.queued.add(message)
+            else reportFailure(player, IllegalArgumentException(text(player, "editor.throttled")))
+            return
+        }
+        process(player, message)
+    }
+
+    private fun process(player: Player, message: ByteArray) {
         try {
             val bytes = if (EditorProtocol.isFrame(message)) {
                 incomingFrames.getOrPut(player.uniqueId) { EditorProtocol.FrameAssembler() }.accept(message) ?: return
@@ -181,17 +220,49 @@ class EditorService(
         } catch (_: EditorProtocol.ProtocolMismatchException) {
             rejectEditor(player)
         } catch (error: Exception) {
-            val revision = drafts[player.uniqueId]?.revision ?: -1
-            send(player, EditorProtocol.ErrorPacket(revision,
-                language.errorText(player, protocolFailure(error), "editor.protocol-error")))
-            drafts[player.uniqueId]?.let { draft ->
-                try {
-                    sendSnapshot(player, draft)
-                } catch (snapshotError: Exception) {
-                    plugin.logger.warning(language.log("editor.snapshot-failed", draft.menuId,
-                        language.errorText(player, protocolFailure(snapshotError), "editor.protocol-error")))
-                }
+            reportFailure(player, error)
+        }
+    }
+
+    private fun reportFailure(player: Player, error: Exception) {
+        val revision = drafts[player.uniqueId]?.revision ?: -1
+        send(player, EditorProtocol.ErrorPacket(revision,
+            language.errorText(player, protocolFailure(error), "editor.protocol-error")))
+        drafts[player.uniqueId]?.let { draft ->
+            try {
+                sendSnapshot(player, draft)
+            } catch (snapshotError: Exception) {
+                plugin.logger.warning(language.log("editor.snapshot-failed", draft.menuId,
+                    language.errorText(player, protocolFailure(snapshotError), "editor.protocol-error")))
             }
+        }
+    }
+
+    /**
+     * Runs [work] on the file channel while the player's later packets wait, then finishes on the
+     * player's thread with [complete] if [draft] is still the player's open draft.
+     */
+    private fun <T> fileOperation(player: Player, draft: EditorDraft, work: () -> T, complete: (T) -> Unit) {
+        val inbox = inboxes.computeIfAbsent(player.uniqueId) { Inbox() }
+        inbox.busy = true
+        files.submit(work).whenComplete { result, error ->
+            val resume = Runnable {
+                inbox.busy = false
+                try {
+                    if (error != null) throw (error.cause ?: error).let { it as? Exception ?: RuntimeException(it) }
+                    if (drafts[player.uniqueId] === draft) complete(result)
+                } catch (failure: Exception) {
+                    reportFailure(player, failure)
+                }
+                drain(player, inbox)
+            }
+            if (!ArcScheduler.execute(plugin, player, resume)) inboxes.remove(player.uniqueId, inbox)
+        }
+    }
+
+    private fun drain(player: Player, inbox: Inbox) {
+        while (!inbox.busy && inboxes[player.uniqueId] === inbox) {
+            process(player, inbox.queued.poll() ?: return)
         }
     }
 
@@ -234,17 +305,17 @@ class EditorService(
                 draft.redo(packet.revision()); refresh(player, draft)
                 ack(player, draft, EditorProtocol.OP_REDO, null, null, text(player, "editor.redone"))
             }
-            is EditorProtocol.SavePacket -> {
-                val result = draft.save(packet.revision())
-                val loaded = applyCatalog()
+            is EditorProtocol.SavePacket -> fileOperation(player, draft, {
+                draft.save(packet.revision()) to applyCatalog()
+            }) { (result, loaded) ->
                 require(loaded.applied) { text(player, "editor.apply-failed", loaded.errors.joinToString("; ")) }
                 ack(player, draft, EditorProtocol.OP_SAVE, null, null, saveMessage(player, result))
             }
-            is EditorProtocol.ApplyPacket -> {
-                val saved = saveMessage(player, draft.save(packet.revision()))
-                val result = applyCatalog()
+            is EditorProtocol.ApplyPacket -> fileOperation(player, draft, {
+                draft.save(packet.revision()) to applyCatalog()
+            }) { (saved, result) ->
                 require(result.applied) { text(player, "editor.apply-failed", result.errors.joinToString("; ")) }
-                ack(player, draft, EditorProtocol.OP_APPLY, null, null, text(player, "editor.applied", saved, result.count))
+                ack(player, draft, EditorProtocol.OP_APPLY, null, null, text(player, "editor.applied", saveMessage(player, saved), result.count))
             }
             is EditorProtocol.ProbePacket -> {
                 require(packet.revision() == draft.revision) { text(player, "editor.revision-conflict", packet.revision(), draft.revision) }
@@ -313,20 +384,25 @@ class EditorService(
                 val source = draft.templateSource(packet.revision(), packet.nodeId(), packet.templateId())
                 val file = templateDirectory.resolve("${packet.templateId()}.yml").normalize()
                 require(file.startsWith(templateDirectory.normalize())) { text(player, "editor.template-outside") }
-                require(!Files.exists(file)) { text(player, "editor.template-exists", packet.templateId()) }
-                Files.createDirectories(templateDirectory)
-                val temp = file.resolveSibling(".${file.fileName}.${UUID.randomUUID()}.tmp")
-                Files.writeString(temp, source)
-                try {
-                    try { Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE) }
-                    catch (_: Exception) { Files.move(temp, file) }
-                    val loaded = reloadTemplates()
-                    if (!loaded.applied) {
-                        Files.deleteIfExists(file); reloadTemplates()
-                        throw IllegalArgumentException(text(player, "editor.template-invalid", loaded.errors.joinToString("; ")))
-                    }
-                } finally { Files.deleteIfExists(temp) }
-                ack(player, draft, EditorProtocol.OP_TEMPLATE_SAVE, null, null, text(player, "editor.template-saved", packet.templateId()))
+                val exists = text(player, "editor.template-exists", packet.templateId())
+                fileOperation(player, draft, {
+                    require(!Files.exists(file)) { exists }
+                    Files.createDirectories(templateDirectory)
+                    val temp = file.resolveSibling(".${file.fileName}.${UUID.randomUUID()}.tmp")
+                    Files.writeString(temp, source)
+                    try {
+                        try { Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE) }
+                        catch (_: Exception) { Files.move(temp, file) }
+                        val loaded = reloadTemplates()
+                        if (!loaded.applied) {
+                            Files.deleteIfExists(file); reloadTemplates()
+                        }
+                        loaded
+                    } finally { Files.deleteIfExists(temp) }
+                }) { loaded ->
+                    require(loaded.applied) { text(player, "editor.template-invalid", loaded.errors.joinToString("; ")) }
+                    ack(player, draft, EditorProtocol.OP_TEMPLATE_SAVE, null, null, text(player, "editor.template-saved", packet.templateId()))
+                }
             }
             is EditorProtocol.InstantiateTemplatePacket -> {
                 val template = templates()[packet.templateId()] ?: throw IllegalArgumentException(text(player, "editor.template-missing", packet.templateId()))
@@ -342,8 +418,9 @@ class EditorService(
                 require(Regex("[a-z0-9][a-z0-9_-]*").matches(packet.templateId())) { text(player, "editor.template-id-invalid") }
                 val template = templates()[packet.templateId()]
                     ?: throw IllegalArgumentException(text(player, "editor.template-missing", packet.templateId()))
-                TemplateFileOperations.delete(templateDirectory, template, reloadTemplates)
-                ack(player, draft, EditorProtocol.OP_TEMPLATE_DELETE, null, null, text(player, "editor.template-deleted", packet.templateId()))
+                fileOperation(player, draft, { TemplateFileOperations.delete(templateDirectory, template, reloadTemplates) }) {
+                    ack(player, draft, EditorProtocol.OP_TEMPLATE_DELETE, null, null, text(player, "editor.template-deleted", packet.templateId()))
+                }
             }
             is EditorProtocol.HelloPacket, is EditorProtocol.ClosePacket,
             is EditorProtocol.SnapshotPacket, is EditorProtocol.AckPacket, is EditorProtocol.ErrorPacket ->
@@ -439,6 +516,10 @@ class EditorService(
         ArcMessages.reply(player, text(player, "editor.update-required", EditorProtocol.EDITOR_VERSION))
     }
 
+    private companion object {
+        const val MAX_QUEUED_MESSAGES = 256
+    }
+
     private fun text(player: Player, key: String, vararg arguments: Any?): String =
         language.text(player, key, *arguments)
 
@@ -450,19 +531,20 @@ class EditorService(
     } else text(player, "editor.saved-none")
 
 
-    @Synchronized fun closeAll() {
+    fun closeAll() {
         drafts.keys.toList().mapNotNull(Bukkit::getPlayer).forEach { player ->
             val expected = drafts[player.uniqueId]
-            val cleanup = Runnable { synchronized(this) { if (drafts[player.uniqueId] === expected) close(player) } }
+            val cleanup = Runnable { if (drafts[player.uniqueId] === expected) close(player) }
             if (Bukkit.isStopping()) cleanup.run() else ArcScheduler.execute(plugin, player, cleanup)
         }
 
     }
 
-    override @Synchronized fun close() {
+    override fun close() {
         closeAll()
         clientVersions.clear()
         incomingFrames.clear()
+        inboxes.clear()
         plugin.server.messenger.unregisterIncomingPluginChannel(plugin, EditorProtocol.CHANNEL, this)
         plugin.server.messenger.unregisterOutgoingPluginChannel(plugin, EditorProtocol.CHANNEL)
     }

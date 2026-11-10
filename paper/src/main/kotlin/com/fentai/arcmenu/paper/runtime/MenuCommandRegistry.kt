@@ -14,7 +14,11 @@ import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
 import java.util.Locale
 
-/** Owns the live Bukkit commands declared by the currently published menu set. */
+/**
+ * Owns the live Bukkit commands declared by the currently published menu set. The command map
+ * is only changed on the global region (Paper: the main thread), plugin enable or disable;
+ * region threads keep dispatching commands while it changes.
+ */
 class MenuCommandRegistry(
     private val plugin: Plugin,
     private val language: LanguageManager,
@@ -23,11 +27,11 @@ class MenuCommandRegistry(
     private val commandMap = plugin.server.commandMap
     private val fallbackPrefix = plugin.name.lowercase(Locale.ROOT)
     private val registered = linkedMapOf<String, Command>()
-    private var current: MenuEntrypoints? = null
+    @Volatile private var current: MenuEntrypoints? = null
 
     val mainMenuId: String? get() = current?.mainMenuId
 
-    fun validate(documents: Map<String, MenuDocument>) {
+    @Synchronized fun validate(documents: Map<String, MenuDocument>) {
         val entrypoints = MenuEntrypointCompiler.compile(documents)
         val owned = registered.values.toSet()
         entrypoints.commands.keys.forEach { label ->
@@ -43,7 +47,7 @@ class MenuCommandRegistry(
         }
     }
 
-    fun replace(documents: Map<String, MenuDocument>) {
+    @Synchronized fun replace(documents: Map<String, MenuDocument>) {
         val next = MenuEntrypointCompiler.compile(documents)
         validate(documents)
         if (next == current) return
@@ -89,7 +93,7 @@ class MenuCommandRegistry(
         ArcScheduler.execute(plugin, player, Runnable { if (player.isOnline) player.updateCommands() })
     }
 
-    override fun close() {
+    @Synchronized override fun close() {
         unregisterAll()
         current = null
     }
@@ -106,7 +110,9 @@ class MenuCommandRegistry(
                 ArcMessages.reply(sender, language.text(sender, "command.custom.player-only"))
                 return true
             }
-            opener(player, menuId, args.toList())
+            val arguments = args.toList()
+            if (ArcScheduler.owns(player)) opener(player, menuId, arguments)
+            else ArcScheduler.execute(plugin, player, Runnable { if (player.isOnline) opener(player, menuId, arguments) })
             return true
         }
     }
