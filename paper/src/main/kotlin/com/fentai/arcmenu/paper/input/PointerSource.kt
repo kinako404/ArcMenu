@@ -90,7 +90,7 @@ object PointerSettingsLoader {
 /**
  * Packet-driven cursor with a private fixed camera. LOOK/POSITION_LOOK/POSITION
  * packets are consumed while active, so hidden rotation and movement never reach
- * the server player. Bukkit entity work remains on the server thread.
+ * the server player. Bukkit entity work stays on the thread that owns the player.
  */
 class PointerController(
     private val plugin: Plugin,
@@ -151,7 +151,7 @@ class PointerController(
     }
 
     private fun begin(player: Player, plane: MenuPlane, mode: PointerMode): PointerMode {
-        check(Bukkit.isPrimaryThread()) { "摄像机实体只能在服务端主线程创建" }
+        check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程创建" }
         if (mode != PointerMode.MOUSE) {
             end(player)
             activeInputs.add(player.uniqueId)
@@ -182,7 +182,7 @@ class PointerController(
                 }
             } catch (error: Throwable) {
                 cursors.remove(player.uniqueId, state)
-                camera.remove()
+                ArcScheduler.remove(plugin, camera)
                 throw error
             }
         } else {
@@ -211,7 +211,7 @@ class PointerController(
 
     /** Rebuilds only camera state and preserves the cursor point across respawn/world relocation. */
     fun reanchor(player: Player, plane: MenuPlane) {
-        check(Bukkit.isPrimaryThread()) { "摄像机实体只能在服务端主线程重建" }
+        check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程重建" }
         val state = cursors[player.uniqueId] ?: return
         val replacement = spawnCamera(player, plane)
         player.showEntity(plugin, replacement)
@@ -221,7 +221,7 @@ class PointerController(
             packets.hideFirstPersonHands(player)
             packets.resetClientRotation(player, centreYaw, 0.0f)
         } catch (error: Throwable) {
-            replacement.remove()
+            ArcScheduler.remove(plugin, replacement)
             throw error
         }
         val previous = synchronized(state) {
@@ -236,14 +236,14 @@ class PointerController(
             state.recentring = false
             old
         }
-        previous.remove()
+        ArcScheduler.remove(plugin, previous)
     }
 
     fun end(player: Player) {
         activeInputs.remove(player.uniqueId)
         suspendedInputs.remove(player.uniqueId)
         menuInput.state(player, false)
-        check(Bukkit.isPrimaryThread()) { "摄像机实体只能在服务端主线程移除" }
+        check(ArcScheduler.mayTouch(player)) { "摄像机实体只能在玩家所属的区域线程移除" }
         val state = cursors[player.uniqueId] ?: return
         val alreadyEnding = synchronized(state) {
             val previous = state.ending
@@ -263,11 +263,12 @@ class PointerController(
             // This second absolute sync is an ordered barrier. Its acknowledgement proves that
             // both the authoritative position and real game mode were processed before handoff.
             packets.synchronizeClientPlayer(player) { id -> state.exit.expect(id) }
-            Bukkit.getScheduler().runTaskLater(plugin, Runnable {
+            val timeout = ArcScheduler.later(plugin, player, Runnable {
                 if (cursors[player.uniqueId] === state && synchronized(state) { state.ending }) {
                     completeEnd(player, state)
                 }
             }, EXIT_ACK_TIMEOUT_TICKS)
+            if (timeout == null) completeEndImmediately(player, state)
         } catch (error: Throwable) {
             completeEndImmediately(player, state)
             throw error
@@ -279,18 +280,18 @@ class PointerController(
         activeInputs.remove(player.uniqueId)
         suspendedInputs.remove(player.uniqueId)
         val state = cursors.remove(player.uniqueId) ?: return
-        state.camera.remove()
+        ArcScheduler.remove(plugin, state.camera)
     }
 
     private fun completeEnd(player: Player, expected: CursorState) {
-        check(Bukkit.isPrimaryThread()) { "摄像机只能在服务端主线程交还" }
+        check(ArcScheduler.mayTouch(player)) { "摄像机只能在玩家所属的区域线程交还" }
         if (!cursors.remove(player.uniqueId, expected)) return
         try {
             if (player.isOnline) packets.setCamera(player, player)
         } catch (error: Throwable) {
             plugin.logger.warning("无法在鼠标模式退出时交还 ${player.name} 的摄像机: ${error.message.orEmpty()}")
         } finally {
-            expected.camera.remove()
+            ArcScheduler.remove(plugin, expected.camera)
         }
     }
 
@@ -303,7 +304,7 @@ class PointerController(
                 runCatching { packets.setCamera(player, player) }
             }
         } finally {
-            expected.camera.remove()
+            ArcScheduler.remove(plugin, expected.camera)
         }
     }
 
@@ -378,7 +379,7 @@ class PointerController(
                 requestRecentre = true
             }
         }
-        if (requestRecentre) Bukkit.getScheduler().runTask(plugin, Runnable { recentre(player, state) })
+        if (requestRecentre) ArcScheduler.execute(plugin, player, Runnable { recentre(player, state) })
         return true
     }
 
@@ -401,7 +402,7 @@ class PointerController(
             state.ending && state.exit.accept(teleportId)
         }
         if (exitAccepted && plugin.isEnabled) {
-            Bukkit.getScheduler().runTask(plugin, Runnable { completeEnd(player, state) })
+            ArcScheduler.execute(plugin, player, Runnable { completeEnd(player, state) })
         }
     }
 
@@ -450,7 +451,7 @@ class PointerController(
             menuInput.state(player, false)
             cursors[player.uniqueId]?.let { completeEndImmediately(player, it) }
         }
-        cursors.values.forEach { it.camera.remove() }
+        cursors.values.forEach { ArcScheduler.remove(plugin, it.camera) }
         cursors.clear()
         activeInputs.clear()
         suspendedInputs.clear()

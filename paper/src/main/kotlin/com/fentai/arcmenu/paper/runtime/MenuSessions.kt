@@ -31,8 +31,10 @@ import org.bukkit.entity.Player
 import org.bukkit.persistence.PersistentDataType
 import org.bukkit.plugin.Plugin
 import org.bukkit.scheduler.BukkitTask
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import org.bukkit.util.Vector
-import java.util.ArrayDeque
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -112,7 +114,7 @@ class MenuSessions(
         val trackedResources = mutableListOf<AutoCloseable>()
 
         fun cleanupSurfaceEntities() {
-            trackedEntities.toList().forEach { runCatching { if (it.isValid) it.remove() } }
+            trackedEntities.toList().forEach { runCatching { if (it.isValid) ArcScheduler.remove(plugin, it) } }
             trackedEntities.clear()
         }
 
@@ -202,23 +204,18 @@ class MenuSessions(
 
         override fun execute(task: Runnable): Boolean {
             if (!isActive()) return false
-            if (Bukkit.isPrimaryThread()) {
-                if (!isActive()) return false
-                task.run()
-            } else {
-                Bukkit.getScheduler().runTask(plugin, Runnable { if (isActive()) task.run() })
-            }
-            return true
+            return ArcScheduler.execute(plugin, runtime.player, Runnable { if (isActive()) task.run() })
         }
 
         override fun runLater(delayTicks: Long, task: Runnable): BukkitTask {
             mainThread()
             require(isActive()) { "应用会话已经关闭" }
-            val scheduled = Bukkit.getScheduler().runTaskLater(
+            val scheduled = ArcScheduler.bukkitTask(plugin, ArcScheduler.later(
                 plugin,
+                runtime.player,
                 Runnable { if (isActive()) task.run() },
-                delayTicks.coerceAtLeast(1L),
-            )
+                delayTicks,
+            ))
             synchronized(runtime.trackedTasks) { runtime.trackedTasks += scheduled }
             return scheduled
         }
@@ -226,12 +223,13 @@ class MenuSessions(
         override fun runTimer(delayTicks: Long, periodTicks: Long, task: Runnable): BukkitTask {
             mainThread()
             require(isActive()) { "应用会话已经关闭" }
-            val scheduled = Bukkit.getScheduler().runTaskTimer(
+            val scheduled = ArcScheduler.bukkitTask(plugin, ArcScheduler.timer(
                 plugin,
+                runtime.player,
+                delayTicks,
+                periodTicks,
                 Runnable { if (isActive()) task.run() },
-                delayTicks.coerceAtLeast(1L),
-                periodTicks.coerceAtLeast(1L),
-            )
+            ))
             synchronized(runtime.trackedTasks) { runtime.trackedTasks += scheduled }
             return scheduled
         }
@@ -257,23 +255,28 @@ class MenuSessions(
         }
 
         private fun mainThread() {
-            check(Bukkit.isPrimaryThread()) { "ArcMenu 应用上下文必须在服务端主线程调用；异步结果请使用 execute" }
+            check(ArcScheduler.mayTouch(runtime.player)) {
+                "ArcMenu 应用上下文必须在玩家所属的区域线程调用（Paper 为主线程）；异步结果请使用 execute"
+            }
         }
     }
 
     private val executor = ActionExecutor(plugin, placeholders, state, language)
     private val arcitx = ArcitxAnvilService(plugin, ::updateArcitx, ::finishArcitx)
-    private val sessions = mutableMapOf<UUID, Session>()
-    private val applicationSessions = mutableMapOf<UUID, HostedApplication>()
-    private val history = mutableMapOf<UUID, ArrayDeque<Route>>()
-    private val lastActivation = mutableMapOf<UUID, Long>()
-    private val routeDepth = mutableMapOf<UUID, Int>()
-    private val routePlacement = mutableMapOf<UUID, Placement>()
-    private val catcherInputs = mutableMapOf<UUID, CatcherInput>()
-    private val retypeRequests = mutableSetOf<UUID>()
+    // Folia ticks players on different region threads at the same time. Every
+    // per-player entry is only mutated from that player's owning thread, but the
+    // maps themselves are shared, so they must be concurrent.
+    private val sessions = ConcurrentHashMap<UUID, Session>()
+    private val applicationSessions = ConcurrentHashMap<UUID, HostedApplication>()
+    private val history = ConcurrentHashMap<UUID, ConcurrentLinkedDeque<Route>>()
+    private val lastActivation = ConcurrentHashMap<UUID, Long>()
+    private val routeDepth = ConcurrentHashMap<UUID, Int>()
+    private val routePlacement = ConcurrentHashMap<UUID, Placement>()
+    private val catcherInputs = ConcurrentHashMap<UUID, CatcherInput>()
+    private val retypeRequests = ConcurrentHashMap.newKeySet<UUID>()
     private val awaitingChats = ConcurrentHashMap.newKeySet<UUID>()
     private val captureKey = NamespacedKey(plugin, "menu-capture-owner")
-    private var ticker: BukkitTask? = null
+    private val tickers = ConcurrentHashMap<UUID, ScheduledTask>()
 
     val size: Int get() = sessions.size + applicationSessions.size
     val runtimeSize: Int get() = sessions.values.count { it.mode == MenuViewMode.RUNTIME } + applicationSessions.size
@@ -411,9 +414,9 @@ class MenuSessions(
         if (placement != null) routePlacement[player.uniqueId] = placement
 
         if (remember && previous?.mode == MenuViewMode.RUNTIME && previous.menu.id != menu.id) {
-            history.computeIfAbsent(player.uniqueId) { ArrayDeque() }.push(MenuRoute(previous.menu.id, state.arguments(player)))
+            history.computeIfAbsent(player.uniqueId) { ConcurrentLinkedDeque() }.push(MenuRoute(previous.menu.id, state.arguments(player)))
         } else if (remember && previousApplication != null) {
-            history.computeIfAbsent(player.uniqueId) { ArrayDeque() }
+            history.computeIfAbsent(player.uniqueId) { ConcurrentLinkedDeque() }
                 .push(ApplicationRoute(previousApplication.registration.id, previousApplication.arguments))
         }
         val closeResult = removeSession(
@@ -501,10 +504,10 @@ class MenuSessions(
         if (inheritedPlacement != null) routePlacement[player.uniqueId] = inheritedPlacement
 
         if (remember && previous?.mode == MenuViewMode.RUNTIME) {
-            history.computeIfAbsent(player.uniqueId) { ArrayDeque() }
+            history.computeIfAbsent(player.uniqueId) { ConcurrentLinkedDeque() }
                 .push(MenuRoute(previous.menu.id, state.arguments(player)))
         } else if (remember && previousApplication != null && previousApplication.registration.id != registration.id) {
-            history.computeIfAbsent(player.uniqueId) { ArrayDeque() }
+            history.computeIfAbsent(player.uniqueId) { ConcurrentLinkedDeque() }
                 .push(ApplicationRoute(previousApplication.registration.id, previousApplication.arguments))
         }
 
@@ -665,10 +668,10 @@ class MenuSessions(
             session.lastRegion = null
             session.cursorChoosing = false
             cursorStyle?.let { style -> session.lastPoint?.let { createdView.updateCursor(it, style) } }
-            previousCapture.remove()
+            ArcScheduler.remove(plugin, previousCapture)
             previousView.close()
         } catch (error: Exception) {
-            nextCapture?.remove()
+            nextCapture?.let { ArcScheduler.remove(plugin, it) }
             nextView?.close()
             plugin.logger.warning(language.log("log.menu-reanchor-failed", player.name, error.message.orEmpty()))
         }
@@ -711,13 +714,13 @@ class MenuSessions(
             runtime.lastPoint?.let { point ->
                 cursorStyle?.let { createdOverlay.updateCursor(point, it, runtime.cursorInteractive) }
             }
-            previousCapture.remove()
+            ArcScheduler.remove(plugin, previousCapture)
             previousOverlay.close()
             invokeApplication(runtime, "surface") {
                 runtime.callback?.onSurfaceChanged(ArcMenuSurfaceEvent(runtime.context.surface(), false))
             }
         } catch (error: Throwable) {
-            nextCapture?.remove()
+            nextCapture?.let { ArcScheduler.remove(plugin, it) }
             nextOverlay?.close()
             reportApplicationFailure(player, runtime.registration.id, "surface", error)
             false
@@ -778,9 +781,9 @@ class MenuSessions(
 
     override fun schedule(player: Player, delayTicks: Long, task: () -> Unit) {
         val expected = sessions[player.uniqueId] ?: return
-        Bukkit.getScheduler().runTaskLater(plugin, Runnable {
+        ArcScheduler.later(plugin, player, Runnable {
             if (player.isOnline && sessions[player.uniqueId] === expected) task()
-        }, delayTicks.coerceAtLeast(1L))
+        }, delayTicks)
     }
 
     override fun startCatcher(player: Player, catcher: CatcherAction) {
@@ -1051,10 +1054,10 @@ class MenuSessions(
                 arcitxBuffers = arcitxBuffers,
             )
             sessions[player.uniqueId] = session
-            ensureTicker()
+            ensureTicker(player)
             session
         } catch (error: Exception) {
-            capture?.remove()
+            capture?.let { ArcScheduler.remove(plugin, it) }
             view?.close()
             if (pointer.isMouseActive(player) && sessions[player.uniqueId] == null) pointer.end(player)
             throw error
@@ -1115,7 +1118,7 @@ class MenuSessions(
             if (!invokeApplication(runtime, "surface") {
                     callback.onSurfaceChanged(ArcMenuSurfaceEvent(runtime.context.surface(), true))
                 }) return false
-            ensureTicker()
+            ensureTicker(player)
             return true
         } catch (error: Throwable) {
             val current = applicationSessions[player.uniqueId]
@@ -1125,7 +1128,7 @@ class MenuSessions(
             if (current != null && current.registration.token == registration.token) {
                 removeApplication(player, ArcMenuApplicationCloseReason.ERROR, preservePointer = target != null)
             } else {
-                capture?.remove()
+                capture?.let { ArcScheduler.remove(plugin, it) }
                 overlay?.close()
                 if (activeMode == PointerMode.MOUSE && noReplacement) pointer.end(player)
             }
@@ -1148,24 +1151,23 @@ class MenuSessions(
         backend = emptyList(),
     )
 
-    private fun tick() {
+    /** One tick of one player's menu, on the thread that owns that player. */
+    private fun tick(player: Player) {
+        val id = player.uniqueId
         val started = System.nanoTime()
         try {
-            tickSessions()
-            tickApplications()
+            sessions[id]?.let { session ->
+                try {
+                    tickSession(session)
+                } catch (error: NumericExpressionException) {
+                    failSessionTick(session, error)
+                }
+            }
+            applicationSessions[id]?.let(::tickApplication)
         } finally {
             performance.recordTick(System.nanoTime() - started)
         }
-    }
-
-    private fun tickSessions() {
-        for (session in sessions.values.toList()) {
-            try {
-                tickSession(session)
-            } catch (error: NumericExpressionException) {
-                failSessionTick(session, error)
-            }
-        }
+        if (!sessions.containsKey(id) && !applicationSessions.containsKey(id)) tickers.remove(id)?.cancel()
     }
 
     private fun tickSession(session: Session) {
@@ -1282,44 +1284,42 @@ class MenuSessions(
         if (session.player.isOnline) runCatching { message(session.player, "runtime.menu-failed", session.menu.id) }
     }
 
-    private fun tickApplications() {
-        for (runtime in applicationSessions.values.toList()) {
-            if (applicationSessions[runtime.player.uniqueId] !== runtime) continue
-            val player = runtime.player
-            if (!player.isOnline) {
-                removeApplication(player, ArcMenuApplicationCloseReason.PLAYER_QUIT)
-                continue
+    private fun tickApplication(runtime: HostedApplication) {
+        if (applicationSessions[runtime.player.uniqueId] !== runtime) return
+        val player = runtime.player
+        if (!player.isOnline) {
+            removeApplication(player, ArcMenuApplicationCloseReason.PLAYER_QUIT)
+            return
+        }
+        if (!runtime.registration.owner.isEnabled) {
+            closeApplications(runtime.registration.owner)
+            return
+        }
+        runtime.ticks++
+        if (player.isDead) return
+        val cameraInvalid = runtime.pointerMode == PointerMode.MOUSE && !pointer.hasValidCamera(player)
+        if (player.world.uid != runtime.worldId || !runtime.overlay.valid || !runtime.capture.isValid || cameraInvalid) {
+            if (runtime.ticks % REPAIR_INTERVAL_TICKS == 0L) reanchorApplication(runtime)
+            return
+        }
+        if (runtime.pointerMode == PointerMode.MOUSE && !pointer.isReady(player)) return
+        runtime.overlay.refreshDepthEye()
+        if (runtime.pointerMode == PointerMode.MOUSE) pointer.poll(player)
+        val point = pointer.sample(player, runtime.plane)
+        val previous = runtime.lastPoint
+        if (!Transforms.approximatelySame(point, previous)) {
+            if (point != null && runtime.pointerMode == PointerMode.MOUSE) {
+                runtime.overlay.updateCursor(point, pointer.settings.cursorStyle, runtime.cursorInteractive)
             }
-            if (!runtime.registration.owner.isEnabled) {
-                closeApplications(runtime.registration.owner)
-                continue
-            }
-            runtime.ticks++
-            if (player.isDead) continue
-            val cameraInvalid = runtime.pointerMode == PointerMode.MOUSE && !pointer.hasValidCamera(player)
-            if (player.world.uid != runtime.worldId || !runtime.overlay.valid || !runtime.capture.isValid || cameraInvalid) {
-                if (runtime.ticks % REPAIR_INTERVAL_TICKS == 0L) reanchorApplication(runtime)
-                continue
-            }
-            if (runtime.pointerMode == PointerMode.MOUSE && !pointer.isReady(player)) continue
-            runtime.overlay.refreshDepthEye()
-            if (runtime.pointerMode == PointerMode.MOUSE) pointer.poll(player)
-            val point = pointer.sample(player, runtime.plane)
-            val previous = runtime.lastPoint
-            if (!Transforms.approximatelySame(point, previous)) {
-                if (point != null && runtime.pointerMode == PointerMode.MOUSE) {
-                    runtime.overlay.updateCursor(point, pointer.settings.cursorStyle, runtime.cursorInteractive)
-                }
-                runtime.lastPoint = point
-                if (!invokeApplication(runtime, "pointer") {
-                        runtime.callback?.onPointerMove(ArcMenuPointerMoveEvent(point.api(), previous.api()))
-                    }) continue
-            }
-            if (applicationSessions[player.uniqueId] !== runtime) continue
-            if (runtime.ticks % runtime.registration.options.tickInterval == 0L) {
-                invokeApplication(runtime, "tick") {
-                    runtime.callback?.onTick(ArcMenuTickEvent(runtime.ticks))
-                }
+            runtime.lastPoint = point
+            if (!invokeApplication(runtime, "pointer") {
+                    runtime.callback?.onPointerMove(ArcMenuPointerMoveEvent(point.api(), previous.api()))
+                }) return
+        }
+        if (applicationSessions[player.uniqueId] !== runtime) return
+        if (runtime.ticks % runtime.registration.options.tickInterval == 0L) {
+            invokeApplication(runtime, "tick") {
+                runtime.callback?.onTick(ArcMenuTickEvent(runtime.ticks))
             }
         }
     }
@@ -1341,17 +1341,13 @@ class MenuSessions(
         closeArcitx(removed)
         cancelInput(player)
         if (removed.pointerMode == PointerMode.MOUSE && !preservePointer) pointer.end(player)
-        removed.capture.remove()
+        ArcScheduler.remove(plugin, removed.capture)
         removed.view.close()
         if (player.isOnline) player.sendActionBar(Component.empty())
         val result = if (runCloseEvent && !removed.closeEventRun) {
             removed.closeEventRun = true
             executor.run(removed.menu.events.close, player, this)
         } else ActionResult.CONTINUE
-        if (sessions.isEmpty() && applicationSessions.isEmpty()) {
-            ticker?.cancel()
-            ticker = null
-        }
         return result
     }
 
@@ -1367,7 +1363,7 @@ class MenuSessions(
                 plugin.logger.warning(language.log("log.app-pointer-close-failed", removed.registration.id, it.message.orEmpty()))
             }
         }
-        removed.capture.remove()
+        ArcScheduler.remove(plugin, removed.capture)
         removed.overlay.close()
         runCatching {
             removed.callback?.onClose(ArcMenuApplicationCloseEvent(reason))
@@ -1377,10 +1373,6 @@ class MenuSessions(
         removed.cleanupResources()
         lastActivation.remove(player.uniqueId)
         if (player.isOnline) player.sendActionBar(Component.empty())
-        if (sessions.isEmpty() && applicationSessions.isEmpty()) {
-            ticker?.cancel()
-            ticker = null
-        }
     }
 
     fun closeApplications(owner: Plugin) {
@@ -1390,16 +1382,7 @@ class MenuSessions(
             }
         }
         history.entries.removeIf { it.value.isEmpty() }
-        applicationSessions.values.filter { it.registration.owner === owner }.toList().forEach { runtime ->
-            val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt)
-            val target = pollHistory(runtime.player)
-            removeApplication(
-                runtime.player,
-                ArcMenuApplicationCloseReason.OWNER_DISABLED,
-                preservePointer = target != null,
-            )
-            if (target != null && runtime.player.isOnline) openRoute(runtime.player, target, placement)
-        }
+        applicationSessions.values.filter { it.registration.owner === owner }.toList().forEach(::closeDisabledApplication)
     }
 
     fun closeApplicationRegistration(token: UUID) {
@@ -1409,16 +1392,32 @@ class MenuSessions(
             }
         }
         history.entries.removeIf { it.value.isEmpty() }
-        applicationSessions.values.filter { it.registration.token == token }.toList().forEach { runtime ->
-            val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt)
-            val target = pollHistory(runtime.player)
-            removeApplication(
-                runtime.player,
-                ArcMenuApplicationCloseReason.OWNER_DISABLED,
-                preservePointer = target != null,
-            )
-            if (target != null && runtime.player.isOnline) openRoute(runtime.player, target, placement)
-        }
+        applicationSessions.values.filter { it.registration.token == token }.toList().forEach(::closeDisabledApplication)
+    }
+
+    /** Closes a disabled application on the thread that owns its player, then reopens the previous route. */
+    private fun closeDisabledApplication(runtime: HostedApplication) = onPlayerThread(runtime.player) {
+        if (applicationSessions[runtime.player.uniqueId] !== runtime) return@onPlayerThread
+        val placement = Placement(runtime.plane, runtime.worldId, runtime.openedAt)
+        val target = pollHistory(runtime.player)
+        removeApplication(
+            runtime.player,
+            ArcMenuApplicationCloseReason.OWNER_DISABLED,
+            preservePointer = target != null,
+        )
+        if (target != null && runtime.player.isOnline && plugin.isEnabled) openRoute(runtime.player, target, placement)
+    }
+
+    /**
+     * Runs per-player work on the player's owning region thread. During shutdown or
+     * ArcMenu's own disable no task can be scheduled, so the cleanup runs inline.
+     */
+    private fun onPlayerThread(player: Player, task: () -> Unit) {
+        if (ArcScheduler.mayTouch(player) || !plugin.isEnabled) {
+            runCatching(task).onFailure {
+                plugin.logger.warning("ArcMenu cleanup for ${player.name} failed: ${it.message.orEmpty()}")
+            }
+        } else ArcScheduler.execute(plugin, player, Runnable(task))
     }
 
     private fun invokeApplication(runtime: HostedApplication, phase: String, callback: () -> Unit): Boolean {
@@ -1493,17 +1492,35 @@ class MenuSessions(
         session.lastAnimation = tick.snapshot
     }
 
+    /** Closes every open menu; each player's entities are released on that player's own thread. */
     fun closeMenus() {
-        applicationSessions.values.toList().forEach { runtime ->
-            removeApplication(runtime.player, ArcMenuApplicationCloseReason.PLUGIN_DISABLE)
-        }
-        sessions.values.toList().forEach { session ->
-            sessions.remove(session.player.uniqueId)
+        val players = linkedMapOf<UUID, Player>()
+        applicationSessions.values.forEach { players[it.player.uniqueId] = it.player }
+        sessions.values.forEach { players[it.player.uniqueId] = it.player }
+        players.values.forEach { player -> onPlayerThread(player) { closeMenusFor(player) } }
+    }
+
+    private fun closeMenusFor(player: Player) {
+        val id = player.uniqueId
+        if (applicationSessions.containsKey(id)) removeApplication(player, ArcMenuApplicationCloseReason.PLUGIN_DISABLE)
+        sessions.remove(id)?.let { session ->
             closeArcitx(session)
             if (session.pointerMode == PointerMode.MOUSE) pointer.end(session.player)
-            session.capture.remove()
+            ArcScheduler.remove(plugin, session.capture)
             session.view.close()
         }
+        history.remove(id)
+        lastActivation.remove(id)
+        routeDepth.remove(id)
+        routePlacement.remove(id)
+        catcherInputs.remove(id)
+        awaitingChats.remove(id)
+        retypeRequests.remove(id)
+        tickers.remove(id)?.cancel()
+    }
+
+    override fun close() {
+        closeMenus()
         sessions.clear()
         applicationSessions.clear()
         history.clear()
@@ -1513,12 +1530,8 @@ class MenuSessions(
         catcherInputs.clear()
         awaitingChats.clear()
         retypeRequests.clear()
-        ticker?.cancel()
-        ticker = null
-    }
-
-    override fun close() {
-        closeMenus()
+        tickers.values.forEach { runCatching { it.cancel() } }
+        tickers.clear()
         arcitx.close()
     }
 
@@ -1595,8 +1608,17 @@ class MenuSessions(
         nodes.forEach(::visit)
     }
 
-    private fun ensureTicker() {
-        if (ticker == null) ticker = Bukkit.getScheduler().runTaskTimer(plugin, Runnable { tick() }, 1L, 1L)
+    /**
+     * Each player with an open menu gets a 1-tick timer on its own entity scheduler,
+     * so the tick follows the player across Folia regions and dimension changes.
+     */
+    private fun ensureTicker(player: Player) {
+        val existing = tickers[player.uniqueId]
+        if (existing != null && !existing.isCancelled) return
+        val task = ArcScheduler.timer(plugin, player, 1L, 1L, Runnable { tick(player) }, Runnable {
+            tickers.remove(player.uniqueId)
+        }) ?: return
+        tickers[player.uniqueId] = task
     }
 
     private fun describe(player: Player, point: MenuPoint?, id: String?): String = if (point == null) {

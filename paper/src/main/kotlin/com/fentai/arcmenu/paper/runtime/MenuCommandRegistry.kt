@@ -6,6 +6,7 @@ import com.fentai.arcmenu.core.config.MenuEntrypoints
 import com.fentai.arcmenu.core.config.MenuFormatException
 import com.fentai.arcmenu.core.model.MenuDocument
 import com.fentai.arcmenu.paper.localization.LanguageManager
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import net.kyori.adventure.text.Component
 import org.bukkit.command.Command
 import org.bukkit.command.CommandSender
@@ -84,7 +85,9 @@ class MenuCommandRegistry(
         registered.clear()
     }
 
-    private fun refreshClientCommands() = plugin.server.onlinePlayers.forEach(Player::updateCommands)
+    private fun refreshClientCommands() = plugin.server.onlinePlayers.forEach { player ->
+        ArcScheduler.execute(plugin, player, Runnable { if (player.isOnline) player.updateCommands() })
+    }
 
     override fun close() {
         unregisterAll()

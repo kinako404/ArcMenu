@@ -13,9 +13,11 @@ internal data class RegisteredApplication(
     val application: ArcMenuApplication,
 )
 
+/** Thread-safe: Folia may register, look up and unregister from different threads. */
 class ApplicationRegistry internal constructor() {
     private val registrations = linkedMapOf<String, RegisteredApplication>()
 
+    @Synchronized
     internal fun register(
         owner: Plugin,
         applicationId: String,
@@ -29,22 +31,27 @@ class ApplicationRegistry internal constructor() {
         return RegisteredApplication(UUID.randomUUID(), owner, id, options, application).also { registrations[id] = it }
     }
 
+    @Synchronized
     internal fun get(applicationId: String): RegisteredApplication? = registrations[applicationId.lowercase()]
 
+    @Synchronized
     internal fun contains(token: UUID): Boolean = registrations.values.any { it.token == token }
 
+    @Synchronized
     internal fun unregister(token: UUID): RegisteredApplication? {
         val entry = registrations.entries.firstOrNull { it.value.token == token } ?: return null
         registrations.remove(entry.key)
         return entry.value
     }
 
+    @Synchronized
     internal fun unregister(owner: Plugin): List<RegisteredApplication> {
         val removed = registrations.values.filter { it.owner === owner }
         registrations.entries.removeIf { it.value.owner === owner }
         return removed
     }
 
+    @Synchronized
     internal fun ids(): Set<String> = registrations.keys.toSet()
 
     private fun normalize(value: String): String {

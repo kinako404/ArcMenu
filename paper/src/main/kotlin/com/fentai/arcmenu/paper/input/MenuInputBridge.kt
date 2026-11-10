@@ -1,5 +1,6 @@
 package com.fentai.arcmenu.paper.input
 
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import com.fentai.arcmenu.paper.runtime.PointerButton
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
@@ -26,7 +27,9 @@ internal class MenuInputBridge(
     override fun onPluginMessageReceived(channel: String, player: Player, message: ByteArray) {
         if (channel != CHANNEL || !active(player)) return
         val input = decodeMenuInput(message) ?: return
-        activate(player, input.first, input.second)
+        ArcScheduler.execute(plugin, player, Runnable {
+            if (active(player)) activate(player, input.first, input.second)
+        })
     }
 
     override fun close() {

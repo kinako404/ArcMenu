@@ -85,7 +85,7 @@ class BukkitMenuRenderer(
         initialAnimation: AnimationSnapshot = AnimationSnapshot(),
         textOverrides: Map<String, Component> = emptyMap(),
     ): MenuView {
-        check(Bukkit.isPrimaryThread()) { "Display operations require the server thread" }
+        check(ArcScheduler.mayTouch(player)) { "Display operations require the thread that owns the player" }
         val view = MenuView(player, plane, textOverrides, mode != MenuViewMode.RUNTIME || cursorStyle != null)
         try {
             compiler.compile(menu.frontend, initialAnimation).forEach { view.draw(it, resolve, initialAnimation) }
@@ -430,7 +430,7 @@ class BukkitMenuRenderer(
                 displayMatrices.remove(display.entityId)
                 displayRotations.remove(display.entityId)
                 interpolationPrimed.remove(display.entityId)
-                display.remove()
+                ArcScheduler.remove(plugin, display)
                 cursor = null
                 cursorAsset = null
                 cursorDefaultAsset = null
@@ -706,7 +706,7 @@ class BukkitMenuRenderer(
             displayMatrices.remove(display.entityId)
             displayRotations.remove(display.entityId)
             interpolationPrimed.remove(display.entityId)
-            display.remove()
+            ArcScheduler.remove(plugin, display)
         }
 
         fun show() {
@@ -715,7 +715,7 @@ class BukkitMenuRenderer(
         }
 
         override fun close() {
-            entities.forEach { it.remove() }
+            entities.forEach { ArcScheduler.remove(plugin, it) }
             entities.clear()
             layerTransforms?.clear()
             overlays.clear()
