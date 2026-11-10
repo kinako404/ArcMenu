@@ -28,11 +28,11 @@
 - 复用旧位置开子菜单 / 应用（`routePlacement`、上一个会话的平面、`back`、应用失败回退）：`createSession` / `createApplication` 先用 `usable()` 检查（同一世界、`owns(平面原点)`、128 格内），否则在玩家眼前重新取平面。
 - `ApplicationContext.spawnPrivate`：位置不归当前区域时 `require` 失败，报“私有实体位置不属于玩家所在的区域线程（Folia），请在玩家附近创建”，不再让 Folia 抛 off-region add entity。
 
-Paper 上的行为：归属检查恒真；`/tp` 仍由 `onTeleport` 重锚（与上游一致），跳变检测只在 Folia 开。唯一可见变化：touch 模式开着菜单走出 128 格后，菜单会在玩家眼前重建（上游是留在原地）。
+Paper 上的行为：归属检查恒真；`/tp` 仍由 `onTeleport` 重锚（与上游一致），跳变检测只在 Folia 开。可见变化有两处：touch 模式开着菜单走出 128 格后，菜单会在玩家眼前重建（上游是留在原地）；玩家下线时清 meta（见 ⑤）。
 
 ## ② P1 入口线程（R§2.4、R§2.7）
 
-- `ArcMenuPlugin.onCommand` 开头：发送者是玩家且当前线程不拥有该玩家（`execute as <玩家> run arcmenu …` 在控制台 / 全局线程或别的区域执行）时，`ArcScheduler.execute` 跳到玩家线程再执行整条子命令（覆盖 open / close / mode / animate / pointer 等所有以玩家为对象的子命令）。Folia 的 `Bukkit.dispatchCommand(player, …)` 本身就拒绝在别的线程调用（`CraftServer.dispatchCommand` 的 `ensureTickThread`），所以“别的插件从全局 / 异步线程替玩家执行”只能经由 `execute as` 进来，同一个入口已覆盖。
+- `ArcMenuPlugin.onCommand` 开头：发送者是玩家而当前线程不拥有该玩家时（别的插件在全局 / 异步 / 别的区域线程上 `commandMap.dispatch(player, …)` 或直接调 `Command.execute`），`ArcScheduler.execute` 跳到玩家线程再执行整条子命令（覆盖 open / close / mode / animate / pointer 等所有以玩家为对象的子命令）。实测控制台 `execute as <玩家> run arcmenu …` 的 Bukkit 发送者仍是控制台（见 ⑦），不会走到这里；`Bukkit.dispatchCommand(player, …)` 在 Folia 上会被服务端自己的 `ensureTickThread` 拒绝。
 - 自定义菜单命令（`open-commands`）：没有改 `MenuCommandRegistry.kt`（归 folia-reload-api），而是在 `ArcMenuPlugin` 构造它的 opener 回调里先跳玩家线程再 `openRoot`。
 - Paper：命令本来就在主线程，`owns` 为真，当场执行。
 
