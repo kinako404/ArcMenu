@@ -22,9 +22,18 @@ data class PerformanceSnapshot(
     private fun percentage(value: Long, total: Long): Double = if (total == 0L) 0.0 else value * 100.0 / total
 }
 
-/** Logical work counters only; network bytes and client FPS require an external profiler/client. */
-class PerformanceMetrics {
-    private var startedAt = System.nanoTime()
+/**
+ * Logical work counters only; network bytes and client FPS require an external profiler/client.
+ * Menus tick per player on that player's thread. [recordSessionTick] folds every player tick
+ * that one thread runs during the same server tick into a single tick sample, so `ticks`,
+ * average and maximum keep their single-timer meaning on Paper and become per region tick on Folia.
+ */
+class PerformanceMetrics(private val currentTick: () -> Long = { -1L }) {
+    private class Frame(var generation: Long, var tick: Long, var nanos: Long)
+
+    @Volatile private var startedAt = System.nanoTime()
+    @Volatile private var generation = 0L
+    private val frames = ThreadLocal<Frame>()
     private val ticks = LongAdder()
     private val tickTotal = LongAdder()
     private val tickMax = AtomicLong()
@@ -38,6 +47,21 @@ class PerformanceMetrics {
         ticks.increment()
         tickTotal.add(nanos)
         tickMax.accumulateAndGet(nanos, ::maxOf)
+    }
+
+    fun recordSessionTick(nanos: Long) {
+        val tick = currentTick()
+        val frame = frames.get() ?: Frame(generation, tick, 0L).also(frames::set)
+        if (frame.generation != generation) {
+            frame.generation = generation
+            frame.tick = tick
+            frame.nanos = 0L
+        } else if (frame.tick != tick) {
+            if (frame.nanos > 0L) recordTick(frame.nanos)
+            frame.tick = tick
+            frame.nanos = 0L
+        }
+        frame.nanos += nanos
     }
 
     fun matrixWrite() = matrixWrites.increment()
@@ -59,6 +83,7 @@ class PerformanceMetrics {
     )
 
     fun reset() {
+        generation++
         startedAt = System.nanoTime()
         ticks.reset()
         tickTotal.reset()

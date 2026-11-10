@@ -51,8 +51,8 @@ class MenuSessions(
     private val performance: PerformanceMetrics,
     private val placeholders: PlaceholderResolver,
     private val state: RuntimeStateStore,
-    private var tooltipStyles: TooltipStyles,
-    private var runtimeScreen: RuntimeScreenSettings,
+    @Volatile private var tooltipStyles: TooltipStyles,
+    @Volatile private var runtimeScreen: RuntimeScreenSettings,
     private val language: LanguageManager,
 ) : RuntimeControl, AutoCloseable {
     private sealed interface Route { val arguments: List<String> }
@@ -84,6 +84,8 @@ class MenuSessions(
         val arcitxBuffers: Map<String, ArcitxBuffer> = emptyMap(),
         var editingArcitx: String? = null,
         var editingSince: Long = 0,
+        var lastPosition: Vec3? = null,
+        var reanchoredAt: Long = -REPAIR_INTERVAL_TICKS,
     ) {
         val editingBuffer: ArcitxBuffer? get() = editingArcitx?.let(arcitxBuffers::get)
     }
@@ -108,6 +110,8 @@ class MenuSessions(
         var ticks: Long = 0
         var lastPoint: MenuPoint? = null
         var cursorInteractive = false
+        var lastPosition: Vec3? = null
+        var reanchoredAt: Long = -REPAIR_INTERVAL_TICKS
         @Volatile var active = true
         val trackedEntities = linkedSetOf<Entity>()
         val trackedTasks = linkedSetOf<BukkitTask>()
@@ -171,6 +175,7 @@ class MenuSessions(
             require(isActive()) { "应用会话已经关闭" }
             val world = requireNotNull(location.world) { "私有实体位置必须包含世界" }
             require(world.uid == runtime.worldId) { "私有实体必须创建在当前应用屏幕所在世界" }
+            require(ArcScheduler.owns(location)) { "私有实体位置不属于玩家所在的区域线程（Folia），请在玩家附近创建" }
             val entity = world.spawn(location, type) {
                 it.isVisibleByDefault = false
                 it.isPersistent = false
@@ -547,6 +552,11 @@ class MenuSessions(
         lastActivation.remove(player.uniqueId)
     }
 
+    /** Drops per-login state after [closeImmediately] for a disconnecting player. */
+    fun forget(player: Player) {
+        state.forget(player)
+    }
+
     override fun playAnimation(player: Player, animationId: String): Boolean {
         val session = sessions[player.uniqueId]?.takeIf { it.mode == MenuViewMode.RUNTIME && !it.closing } ?: return false
         val timeline = session.timeline ?: return false
@@ -631,6 +641,7 @@ class MenuSessions(
         }
         val session = sessions[player.uniqueId]?.takeIf { it.mode == MenuViewMode.RUNTIME } ?: return
         if (!player.isOnline || player.isDead) return
+        session.reanchoredAt = session.ticks
         closeArcitx(session)
         val nextPlane = plane(
             player,
@@ -664,6 +675,7 @@ class MenuSessions(
             session.capture = createdCapture
             session.worldId = player.world.uid
             session.openedAt = vec(player.location.toVector())
+            session.lastPosition = session.openedAt
             session.lastPoint = pointer.sample(player, nextPlane)
             session.lastRegion = null
             session.cursorChoosing = false
@@ -680,6 +692,7 @@ class MenuSessions(
     private fun reanchorApplication(runtime: HostedApplication): Boolean {
         val player = runtime.player
         if (!player.isOnline || player.isDead || applicationSessions[player.uniqueId] !== runtime) return false
+        runtime.reanchoredAt = runtime.ticks
         val canvas = runtime.designCanvas.forRuntimeScreen(runtimeScreen.forMode(runtime.pointerMode))
         val nextPlane = plane(player, canvas, runtime.pointerMode)
         val cursorStyle = pointer.settings.cursorStyle.takeIf { runtime.pointerMode == PointerMode.MOUSE }
@@ -710,6 +723,7 @@ class MenuSessions(
             runtime.capture = createdCapture
             runtime.worldId = player.world.uid
             runtime.openedAt = vec(player.location.toVector())
+            runtime.lastPosition = runtime.openedAt
             runtime.lastPoint = pointer.sample(player, nextPlane)
             runtime.lastPoint?.let { point ->
                 cursorStyle?.let { createdOverlay.updateCursor(point, it, runtime.cursorInteractive) }
@@ -1013,6 +1027,7 @@ class MenuSessions(
         placement: Placement? = null,
         transitionKind: TransitionKind? = null,
     ): Session {
+        val placement = placement?.takeIf { usable(player, it) }
         // Editor previews deliberately enter the same fixed-camera transport as
         // mouse-mode runtime menus.  The Fabric screen uses the native cursor,
         // but the server camera is what makes the editor face the real menu.
@@ -1069,8 +1084,9 @@ class MenuSessions(
         registration: RegisteredApplication,
         arguments: List<String>,
         designCanvas: Canvas,
-        placement: Placement?,
+        requestedPlacement: Placement?,
     ): Boolean {
+        val placement = requestedPlacement?.takeIf { usable(player, it) }
         val pointerMode = pointer.mode(player)
         val canvas = designCanvas.forRuntimeScreen(runtimeScreen.forMode(pointerMode))
         val applicationPlane = placement?.plane?.withCanvas(canvas) ?: plane(player, canvas, pointerMode)
@@ -1165,7 +1181,7 @@ class MenuSessions(
             }
             applicationSessions[id]?.let(::tickApplication)
         } finally {
-            performance.recordTick(System.nanoTime() - started)
+            performance.recordSessionTick(System.nanoTime() - started)
         }
         if (!sessions.containsKey(id) && !applicationSessions.containsKey(id)) tickers.remove(id)?.cancel()
     }
@@ -1179,6 +1195,14 @@ class MenuSessions(
         session.ticks++
         if (session.mode == MenuViewMode.RUNTIME) {
             if (player.isDead) return
+            val position = vec(player.location.toVector())
+            val moved = surfaceMoved(player, session.worldId, session.plane, session.pointerMode, session.capture,
+                session.view, session.lastPosition, position)
+            session.lastPosition = position
+            if (moved) {
+                if (session.ticks - session.reanchoredAt >= REPAIR_INTERVAL_TICKS) reanchorRuntime(player)
+                return
+            }
             val cameraInvalid = session.pointerMode == PointerMode.MOUSE && !pointer.hasValidCamera(player)
             if (player.world.uid != session.worldId || !session.view.valid || !session.capture.isValid || cameraInvalid) {
                 if (session.ticks % REPAIR_INTERVAL_TICKS == 0L) reanchorRuntime(player)
@@ -1297,6 +1321,14 @@ class MenuSessions(
         }
         runtime.ticks++
         if (player.isDead) return
+        val position = vec(player.location.toVector())
+        val moved = surfaceMoved(player, runtime.worldId, runtime.plane, runtime.pointerMode, runtime.capture,
+            runtime.overlay, runtime.lastPosition, position)
+        runtime.lastPosition = position
+        if (moved) {
+            if (runtime.ticks - runtime.reanchoredAt >= REPAIR_INTERVAL_TICKS) reanchorApplication(runtime)
+            return
+        }
         val cameraInvalid = runtime.pointerMode == PointerMode.MOUSE && !pointer.hasValidCamera(player)
         if (player.world.uid != runtime.worldId || !runtime.overlay.valid || !runtime.capture.isValid || cameraInvalid) {
             if (runtime.ticks % REPAIR_INTERVAL_TICKS == 0L) reanchorApplication(runtime)
@@ -1615,10 +1647,46 @@ class MenuSessions(
     private fun ensureTicker(player: Player) {
         val existing = tickers[player.uniqueId]
         if (existing != null && !existing.isCancelled) return
+        var scheduled: ScheduledTask? = null
         val task = ArcScheduler.timer(plugin, player, 1L, 1L, Runnable { tick(player) }, Runnable {
-            tickers.remove(player.uniqueId)
+            scheduled?.let { tickers.remove(player.uniqueId, it) }
+            // Folia also retires the tasks of a player that is between regions (async
+            // teleport, dimension change, respawn); a still connected player is re-armed.
+            if (plugin.isEnabled && player.isOnline && contains(player)) ensureTicker(player)
         }) ?: return
+        scheduled = task
         tickers[player.uniqueId] = task
+    }
+
+    /**
+     * True when the runtime surface must be rebuilt where the player now is: its entities
+     * belong to another Folia region, the player is far from it, or (on Folia, where
+     * `/tp` fires no PlayerTeleportEvent) the player jumped since the previous tick.
+     */
+    private fun surfaceMoved(
+        player: Player,
+        worldId: UUID,
+        plane: MenuPlane,
+        pointerMode: PointerMode,
+        capture: Interaction,
+        view: BukkitMenuRenderer.MenuView,
+        lastPosition: Vec3?,
+        position: Vec3,
+    ): Boolean {
+        if (ArcScheduler.folia && player.world.uid != worldId) return true
+        if (view.misplaced || (capture.isValid && !ArcScheduler.owns(capture))) return true
+        val eye = player.eyeLocation
+        return runtimeAnchorStale(pointerMode, plane.origin, Vec3(eye.x, eye.y, eye.z), lastPosition, position, ArcScheduler.folia)
+    }
+
+    /** A remembered plane can only be reused where this thread may spawn its entities. */
+    private fun usable(player: Player, placement: Placement): Boolean {
+        if (placement.worldId != player.world.uid) return false
+        val origin = placement.plane.origin
+        if (!ArcScheduler.owns(Location(player.world, origin.x, origin.y, origin.z))) return false
+        val eye = player.eyeLocation
+        val offset = origin - Vec3(eye.x, eye.y, eye.z)
+        return offset.dot(offset) <= RUNTIME_REANCHOR_DISTANCE * RUNTIME_REANCHOR_DISTANCE
     }
 
     private fun describe(player: Player, point: MenuPoint?, id: String?): String = if (point == null) {
@@ -1670,3 +1738,29 @@ private fun ArcMenuCanvas.core() = Canvas(width, height, pixelsPerBlock, designD
 private fun MenuPoint?.api(): ArcMenuPoint? = this?.let { ArcMenuPoint(it.x, it.y) }
 private fun PointerMode.api(): ArcMenuPointerMode = ArcMenuPointerMode.valueOf(name)
 private fun PointerButton.api(): ArcMenuPointerButton = ArcMenuPointerButton.valueOf(name)
+
+internal const val RUNTIME_REANCHOR_DISTANCE = 128.0
+private const val TOUCH_TELEPORT_JUMP = 8.0
+private const val MOUSE_TELEPORT_JUMP = 1.0
+
+/**
+ * Runtime menus normally stay where they were opened. They are re-anchored in front of the
+ * player once the player is more than [RUNTIME_REANCHOR_DISTANCE] blocks from the plane, and,
+ * when [detectJumps] is set, after a single-tick jump that only a teleport can produce (mouse
+ * mode consumes all movement packets, so any displacement there is a teleport).
+ */
+internal fun runtimeAnchorStale(
+    pointerMode: PointerMode,
+    planeOrigin: Vec3,
+    eye: Vec3,
+    lastPosition: Vec3?,
+    position: Vec3,
+    detectJumps: Boolean,
+): Boolean {
+    val away = planeOrigin - eye
+    if (away.dot(away) > RUNTIME_REANCHOR_DISTANCE * RUNTIME_REANCHOR_DISTANCE) return true
+    if (!detectJumps || lastPosition == null) return false
+    val step = position - lastPosition
+    val limit = if (pointerMode == PointerMode.MOUSE) MOUSE_TELEPORT_JUMP else TOUCH_TELEPORT_JUMP
+    return step.dot(step) > limit * limit
+}

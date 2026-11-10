@@ -7,16 +7,26 @@ import org.bukkit.Bukkit
 import org.bukkit.OfflinePlayer
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
+import com.fentai.arcmenu.paper.platform.ArcScheduler
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
-/** Optional reflection bridges keep Vault and PlayerPoints out of ArcMenu's hard dependencies. */
+/**
+ * Optional reflection bridges keep Vault and PlayerPoints out of ArcMenu's hard dependencies.
+ * Vault providers are rarely safe for concurrent use, so on Folia every Vault call is serialized
+ * on the global region thread (one tick later unless already there); on Paper it runs in place.
+ */
 class ExternalBalanceBridge(private val plugin: Plugin, private val language: LanguageManager) {
-    private val warnings = mutableSetOf<BalanceKind>()
+    private val warnings = ConcurrentHashMap.newKeySet<BalanceKind>()
 
-    fun apply(player: Player, kind: BalanceKind, operation: BalanceOperation, amount: Double): Boolean = when (kind) {
-        BalanceKind.MONEY -> vault(player, operation, amount)
-        BalanceKind.POINTS -> playerPoints(player, operation, amount.toInt())
-    }.also { success ->
+    fun apply(player: Player, kind: BalanceKind, operation: BalanceOperation, amount: Double) {
+        when (kind) {
+            BalanceKind.MONEY -> ArcScheduler.global(plugin, Runnable { report(kind, vault(player, operation, amount)) })
+            BalanceKind.POINTS -> report(kind, playerPoints(player, operation, amount.toInt()))
+        }
+    }
+
+    private fun report(kind: BalanceKind, success: Boolean) {
         if (!success && warnings.add(kind)) plugin.logger.warning(
             language.log(
                 "log.balance-provider-missing",

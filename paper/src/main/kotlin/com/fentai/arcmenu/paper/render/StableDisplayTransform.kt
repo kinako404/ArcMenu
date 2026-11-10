@@ -50,7 +50,7 @@ internal object StableDisplayTransforms {
     }
 
     fun alignHemisphere(rotation: Quaternionf, previous: Quaternionf?): Quaternionf =
-        Quaternionf(rotation).also { if (previous != null && previous.dot(it) < 0.0f) it.mul(-1.0f) }
+        Quaternionf(rotation).also { if (previous != null && quaternionDot(previous, it) < 0.0f) it.mul(-1.0f) }
 
     /**
      * A newly shown Display may have its spawn metadata and first animated target coalesced by the
@@ -67,3 +67,6 @@ internal object StableDisplayTransforms {
     private const val EPSILON = 1.0e-4f
     private const val MIN_SCALE = 1.0e-7f
 }
+
+/** JOML 1.10.9 (Minecraft 26.3) changed `Quaternionf.dot`'s descriptor; field arithmetic links on every release. */
+internal fun quaternionDot(a: Quaternionf, b: Quaternionf): Float = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w

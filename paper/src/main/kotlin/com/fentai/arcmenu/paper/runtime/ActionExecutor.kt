@@ -19,6 +19,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.time.Duration
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
@@ -43,8 +44,8 @@ class ActionExecutor(
     private val state: RuntimeStateStore,
     private val language: LanguageManager,
 ) {
-    private val warnedSounds = mutableSetOf<String>()
-    private val warnedNumericExpressions = mutableSetOf<String>()
+    private val warnedSounds = ConcurrentHashMap.newKeySet<String>()
+    private val warnedNumericExpressions = ConcurrentHashMap.newKeySet<String>()
     private val balances = ExternalBalanceBridge(plugin, language)
     private val items = ItemActions()
     @Suppress("DEPRECATION") // Paper 26.2 deprecates the legacy Sound key bridge retained by the 1.21.1 baseline.
@@ -112,7 +113,7 @@ class ActionExecutor(
             val action = configured?.action ?: entry
             val options = configured?.options ?: ActionOptions()
             val optionCondition = options.condition
-            val playersCondition = options.players
+            val playersCondition = options.players.takeUnless { options.allOnlinePlayers }
             if (options.chance < 1.0 && Random.nextDouble() >= options.chance) continue
             if (action is DelayAction) {
                 accumulatedDelay += placeholders.expand(player, action.ticks).toLongOrNull()?.coerceAtLeast(0L) ?: 0L
@@ -120,14 +121,9 @@ class ActionExecutor(
             }
             val execute = {
                 if (!delayedChainStopped.get() && (optionCondition == null || evaluate(optionCondition, player))) {
-                    val targets = when {
-                        options.allOnlinePlayers -> Bukkit.getOnlinePlayers().toList()
-                        playersCondition != null -> Bukkit.getOnlinePlayers().filter { evaluate(playersCondition, it) }
-                        else -> listOf(player)
-                    }
-                    for (target in targets) {
+                    for (target in targets(options, player)) {
                         if (elsewhere(target, player)) {
-                            executeElsewhere(action, target, player, control)
+                            executeElsewhere(action, target, player, playersCondition, control)
                             continue
                         }
                         val result = executeOne(action, target, player, control)
@@ -141,14 +137,9 @@ class ActionExecutor(
                 continue
             }
             if (optionCondition != null && !evaluate(optionCondition, player)) continue
-            val targets = when {
-                options.allOnlinePlayers -> Bukkit.getOnlinePlayers().toList()
-                playersCondition != null -> Bukkit.getOnlinePlayers().filter { evaluate(playersCondition, it) }
-                else -> listOf(player)
-            }
-            for (target in targets) {
+            for (target in targets(options, player)) {
                 if (elsewhere(target, player)) {
-                    executeElsewhere(action, target, player, control)
+                    executeElsewhere(action, target, player, playersCondition, control)
                     continue
                 }
                 when (executeOne(action, target, player, control)) {
@@ -161,25 +152,61 @@ class ActionExecutor(
         return if (sessionChanged) ActionResult.SESSION_CHANGED else ActionResult.CONTINUE
     }
 
+    /** Players owned by this thread are filtered by `players:` here; the rest are filtered on their own thread. */
+    private fun targets(options: ActionOptions, player: Player): List<Player> {
+        val condition = options.players
+        return when {
+            options.allOnlinePlayers -> Bukkit.getOnlinePlayers().toList()
+            condition != null -> Bukkit.getOnlinePlayers().filter { elsewhere(it, player) || evaluate(condition, it) }
+            else -> listOf(player)
+        }
+    }
+
     /** On Folia another online player may belong to a different region thread. */
     private fun elsewhere(target: Player, source: Player): Boolean = target !== source && !ArcScheduler.owns(target)
 
-    /** Runs a broadcast action on the target's own thread; its result cannot stop the source chain. */
-    private fun executeElsewhere(action: MenuAction, target: Player, source: Player, control: RuntimeControl) {
+    /**
+     * Runs a broadcast action on the target's own thread; its result cannot stop the source chain.
+     * The source player's placeholders are expanded here, on the source thread, and the target's
+     * `players:` condition is evaluated over there, so neither player is read off its own thread.
+     */
+    private fun executeElsewhere(
+        action: MenuAction,
+        target: Player,
+        source: Player,
+        condition: ConditionExpression?,
+        control: RuntimeControl,
+    ) {
+        val expanded = try {
+            sourceExpansions(action) { placeholders.expand(source, it) }
+        } catch (error: NumericExpressionException) {
+            warnNumericExpression("action", error)
+            return
+        }
         ArcScheduler.execute(plugin, target, Runnable {
-            if (target.isOnline) executeOne(action, target, source, control)
+            if (!target.isOnline || (condition != null && !evaluate(condition, target))) return@Runnable
+            try {
+                executeExpandedAction(action, target, { expanded[it] ?: it }, control)
+            } catch (error: NumericExpressionException) {
+                warnNumericExpression("action", error)
+            }
         })
     }
 
     private fun executeOne(action: MenuAction, player: Player, placeholderPlayer: Player, control: RuntimeControl): ActionResult = try {
-        executeExpandedAction(action, player, placeholderPlayer, control)
+        executeExpandedAction(action, player, { placeholders.expand(placeholderPlayer, it) }, control)
     } catch (error: NumericExpressionException) {
         warnNumericExpression("action", error)
         ActionResult.RETURN
     }
 
-    private fun executeExpandedAction(action: MenuAction, player: Player, placeholderPlayer: Player, control: RuntimeControl): ActionResult {
-        fun expand(value: String) = placeholders.expand(placeholderPlayer, value)
+    private fun executeExpandedAction(
+        action: MenuAction,
+        player: Player,
+        expander: (String) -> String,
+        control: RuntimeControl,
+    ): ActionResult {
+        fun expand(value: String) = expander(value)
         return when (action) {
             is TellAction -> {
                 expand(action.message).split("\\n", "\\r").forEach { player.sendMessage(legacy(it)) }
@@ -205,10 +232,10 @@ class ActionExecutor(
             is OpCommandAction -> {
                 val wasOp = player.isOp
                 try {
-                    player.isOp = true
+                    setOp(player, true)
                     expand(action.command).split(';').forEach { Bukkit.dispatchCommand(player, it.trim().removePrefix("/")) }
                 } finally {
-                    player.isOp = wasOp
+                    setOp(player, wasOp)
                 }
                 ActionResult.CONTINUE
             }
@@ -336,6 +363,9 @@ class ActionExecutor(
         }
     }
 
+    /** The server operator list is shared by every Folia region thread. */
+    private fun setOp(player: Player, op: Boolean) = synchronized(OP_LOCK) { player.isOp = op }
+
     private fun flatten(actions: List<MenuAction>): List<MenuAction> = buildList {
         fun addAction(action: MenuAction) {
             when (action) {
@@ -460,6 +490,40 @@ class ActionExecutor(
     }
 
     private fun legacy(value: String) = LegacyComponentSerializer.legacyAmpersand().deserialize(value)
+}
+
+private val OP_LOCK = Any()
+
+/** Every string [ActionExecutor] expands for [action], mapped to its expansion. */
+internal fun sourceExpansions(action: MenuAction, expand: (String) -> String): Map<String, String> {
+    val texts: List<String> = when (action) {
+        is TellAction -> listOf(action.message)
+        is TellRawAction -> listOf(action.message)
+        is PlayerCommandAction -> listOf(action.command)
+        is ConsoleCommandAction -> listOf(action.command)
+        is OpCommandAction -> listOf(action.command)
+        is ChatAction -> listOf(action.message)
+        is ActionBarAction -> listOf(action.message)
+        is TitleAction -> listOf(action.specification)
+        is BossBarAction -> listOf(action.specification)
+        is SoundAction -> listOf(action.specification)
+        is RefreshAction -> listOfNotNull(action.target)
+        is PlayAnimationAction -> listOf(action.animationId)
+        is StopAnimationAction -> listOf(action.animationId)
+        is OpenMenuAction -> listOf(action.menuId) + action.arguments
+        is OpenApplicationAction -> listOf(action.applicationId) + action.arguments
+        is ConnectAction -> listOf(action.server)
+        is SetStateAction -> listOf(action.specification)
+        is RemoveStateAction -> listOf(action.pattern)
+        is SetArgumentsAction -> listOf(action.specification)
+        is BalanceAction -> listOf(action.amount)
+        is GiveItemAction -> listOf(action.specification)
+        is TakeItemAction -> listOf(action.specification)
+        is RepairItemAction -> listOf(action.targets)
+        is EnchantItemAction -> listOf(action.specification)
+        else -> emptyList()
+    }
+    return texts.associateWith(expand)
 }
 
 internal fun soundAlias(value: String): String = value

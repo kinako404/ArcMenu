@@ -56,6 +56,13 @@ class RuntimeStateStore(private val plugin: Plugin, private val language: Langua
         if (scope != StateScope.META) requestSave()
     }
 
+    /** Meta is per login, like TrMenu's; it is dropped when the player disconnects. */
+    @Synchronized
+    fun forget(player: Player) {
+        meta.remove(player.uniqueId)
+        arguments.remove(player.uniqueId)
+    }
+
     @Synchronized
     fun arguments(player: Player): List<String> = arguments[player.uniqueId].orEmpty().toList()
     @Synchronized

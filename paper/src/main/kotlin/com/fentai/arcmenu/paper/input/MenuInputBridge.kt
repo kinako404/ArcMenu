@@ -5,6 +5,8 @@ import com.fentai.arcmenu.paper.runtime.PointerButton
 import org.bukkit.entity.Player
 import org.bukkit.plugin.Plugin
 import org.bukkit.plugin.messaging.PluginMessageListener
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /** Optional shader-free input from the shared editor while a menu camera owns the player. */
 internal class MenuInputBridge(
@@ -17,7 +19,18 @@ internal class MenuInputBridge(
         plugin.server.messenger.registerOutgoingPluginChannel(plugin, CHANNEL)
     }
 
-    fun available(player: Player): Boolean = CHANNEL in player.listeningPluginChannels
+    private val listeners = ConcurrentHashMap.newKeySet<UUID>()
+
+    fun available(player: Player): Boolean = (CHANNEL in player.listeningPluginChannels).also { listening ->
+        if (listening) listeners += player.uniqueId else listeners -= player.uniqueId
+    }
+
+    /** Netty-safe view of [available], refreshed on the player's thread by every [state] call. */
+    fun listening(player: Player): Boolean = player.uniqueId in listeners
+
+    fun forget(player: Player) {
+        listeners -= player.uniqueId
+    }
 
     fun state(player: Player, enabled: Boolean) {
         if (player.isOnline && available(player)) player.sendPluginMessage(plugin, CHANNEL,
@@ -33,6 +46,7 @@ internal class MenuInputBridge(
     }
 
     override fun close() {
+        listeners.clear()
         plugin.server.messenger.unregisterIncomingPluginChannel(plugin, CHANNEL, this)
         plugin.server.messenger.unregisterOutgoingPluginChannel(plugin, CHANNEL)
     }
