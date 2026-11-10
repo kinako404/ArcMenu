@@ -13,12 +13,13 @@ foreach ($entry in $requiredJdks.GetEnumerator()) {
 }
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $matrix = @(
-    @{ Minecraft = '1.21.1'; Paper = '1.21.1-R0.1-SNAPSHOT'; Java = $Jdk21 },
-    @{ Minecraft = '1.21.4'; Paper = '1.21.4-R0.1-SNAPSHOT'; Java = $Jdk21 },
-    @{ Minecraft = '1.21.6'; Paper = '1.21.6-R0.1-SNAPSHOT'; Java = $Jdk21 },
-    @{ Minecraft = '1.21.11'; Paper = '1.21.11-R0.1-SNAPSHOT'; Java = $Jdk21 },
-    @{ Minecraft = '26.1.2'; Paper = '26.1.2.build.74-stable'; Java = $Jdk25 },
-    @{ Minecraft = '26.2'; Paper = '26.2.build.111-stable'; Java = $Jdk25 }
+    @{ Minecraft = '1.21.1'; Paper = '1.21.1-R0.1-SNAPSHOT'; ProtocolLib = '5.4.0'; Java = $Jdk21 },
+    @{ Minecraft = '1.21.4'; Paper = '1.21.4-R0.1-SNAPSHOT'; ProtocolLib = '5.4.0'; Java = $Jdk21 },
+    @{ Minecraft = '1.21.6'; Paper = '1.21.6-R0.1-SNAPSHOT'; ProtocolLib = '5.4.0'; Java = $Jdk21 },
+    @{ Minecraft = '1.21.11'; Paper = '1.21.11-R0.1-SNAPSHOT'; ProtocolLib = '5.4.0'; Java = $Jdk21 },
+    @{ Minecraft = '26.1.2'; Paper = '26.1.2.build.74-stable'; ProtocolLib = '5.5.0-SNAPSHOT'; Java = $Jdk25 },
+    @{ Minecraft = '26.2'; Paper = '26.2.build.135-stable'; ProtocolLib = '5.5.0-SNAPSHOT'; Java = $Jdk25 },
+    @{ Minecraft = '26.3'; Paper = '26.3.build.246-stable'; ProtocolLib = '5.5.0-SNAPSHOT'; Java = $Jdk25 }
 )
 
 $originalJavaHome = $env:JAVA_HOME
@@ -32,12 +33,13 @@ try {
         $env:JAVA_HOME = $entry.Java
         $env:Path = (Join-Path $entry.Java 'bin') + ';' + $originalPath
         $started = [System.Diagnostics.Stopwatch]::StartNew()
-        & $Maven -B -ntp -q "-Dpaper.version=$($entry.Paper)" clean test
+        & $Maven -B -ntp -q "-Dpaper.version=$($entry.Paper)" "-Dprotocollib.version=$($entry.ProtocolLib)" clean test
         $exitCode = $LASTEXITCODE
         $started.Stop()
         $results.Add([pscustomobject]@{
             Minecraft = $entry.Minecraft
             PaperApi = $entry.Paper
+            ProtocolLib = $entry.ProtocolLib
             Java = (& java --version | Select-Object -First 1)
             Result = if ($exitCode -eq 0) { 'PASS' } else { 'FAIL' }
             Seconds = [math]::Round($started.Elapsed.TotalSeconds, 2)

@@ -15,7 +15,8 @@
 <p align="center">
   <a href="https://github.com/FENTAIIII/ArcMenu/actions/workflows/build.yml"><img src="https://github.com/FENTAIIII/ArcMenu/actions/workflows/build.yml/badge.svg" alt="构建状态"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-38bdf8.svg" alt="MIT 许可证"></a>
-  <img src="https://img.shields.io/badge/Paper-1.21.1--26.2-8b5cf6.svg" alt="Paper 1.21.1 至 26.2">
+  <img src="https://img.shields.io/badge/Paper-1.21.1--26.3-8b5cf6.svg" alt="Paper 1.21.1 至 26.3">
+  <a href="docs/folia/README.md"><img src="https://img.shields.io/badge/Folia-26.3-22c55e.svg" alt="Folia 26.3"></a>
 </p>
 
 ArcMenu 是一款高级菜单插件。你可以为你的 Minecraft 服务器添加极其自由的自定义菜单、动画以及界面，**无需玩家安装任何客户端模组**。所有内容都通过资源包加载（也可在不使用资源包的情况下运行，但功能会受限），运算全部在服务端执行。
@@ -120,7 +121,11 @@ mvn clean verify
 
 构建后的服务端插件位于 `paper/target/ArcMenu-3.0.0.jar`。在 Paper 上安装时必须同时安装 ProtocolLib；PlaceholderAPI、Vault、PlayerPoints 与 CraftEngine 是可选接入，其中 CraftEngine 是当前支持的自定义内容插件。
 
-目标版本范围为 **Paper / Minecraft Java 1.21.1–26.2**。自动编译与测试矩阵覆盖 1.21.1、1.21.4、1.21.6、1.21.11、26.1.2 和 26.2；各版本的真实运行画面仍需单独验收。当前编辑器面向 **Minecraft 26.1.2 Fabric**，需要 Java 25。
+目标版本范围为 **Paper / Minecraft Java 1.21.1–26.3**。自动编译与测试矩阵覆盖 1.21.1、1.21.4、1.21.6、1.21.11、26.1.2、26.2 和 26.3（`scripts/test-paper-version-matrix.sh`；CI 跑其中 1.21.1、1.21.11、26.2、26.3）；各版本的真实运行画面仍需单独验收。当前编辑器面向 **Minecraft 26.1.2 Fabric**，需要 Java 25。
+
+## Folia
+
+本 fork 也能在 **Folia** 上运行（在 Folia 分叉 Shiroha 26.3 上实测）：`plugin.yml` 声明了 `folia-supported: true`，所有调度都走按区域划分的调度器——每个玩家的菜单在该玩家所属的区域线程上运行，目录与命令表的变更在全局区域线程上进行。在普通 Paper 上，这些跳线程都退化成在主线程当场执行，行为与上游一致。Minecraft 26.x（Paper 与 Folia）需要 ProtocolLib 开发版（`5.5.0-SNAPSHOT`，26.3 需要 9cb125f 或更新）。Folia 上不支持用 PlugMan 之类工具热重载 ArcMenu，请重启服务端。支持的版本、线程模型、已知限制以及与上游的差异见 [docs/folia/README.md](docs/folia/README.md)。
 
 ## 项目结构
 

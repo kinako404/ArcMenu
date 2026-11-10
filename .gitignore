@@ -11,7 +11,8 @@
 # Local development instructions and notes
 AGENTS.md
 PLAN.md
-/docs/
+/docs/*
+!/docs/folia/
 __pycache__/
 *.py[cod]
 

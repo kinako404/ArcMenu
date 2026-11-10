@@ -9,13 +9,51 @@ permissions:
 
 jobs:
   verify:
+    name: Paper ${{ matrix.minecraft }} / JDK ${{ matrix.java }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - minecraft: '1.21.1'
+            paper: 1.21.1-R0.1-SNAPSHOT
+            protocollib: 5.4.0
+            java: '21'
+          - minecraft: '1.21.11'
+            paper: 1.21.11-R0.1-SNAPSHOT
+            protocollib: 5.4.0
+            java: '21'
+          - minecraft: '26.2'
+            paper: 26.2.build.135-stable
+            protocollib: 5.5.0-SNAPSHOT
+            protocollib-dev: true
+            java: '25'
+          - minecraft: '26.3'
+            paper: 26.3.build.246-stable
+            protocollib: 5.5.0-SNAPSHOT
+            protocollib-dev: true
+            java: '25'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: ${{ matrix.java }}
           cache: maven
+      - name: Install ProtocolLib dev-build
+        if: ${{ matrix.protocollib-dev }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/install-protocollib-dev.sh -v ${{ matrix.protocollib }}
       - name: Verify
-        run: mvn --batch-mode --no-transfer-progress clean verify
+        run: >-
+          mvn --batch-mode --no-transfer-progress
+          -Dpaper.version=${{ matrix.paper }} -Dprotocollib.version=${{ matrix.protocollib }}
+          clean verify
+      - name: Check JOML linkage (1.10.5 / 1.10.8 / 1.10.9)
+        run: python3 scripts/check-joml-compat.py paper/target/ArcMenu-*.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArcMenu-paper-${{ matrix.minecraft }}
+          path: paper/target/ArcMenu-*.jar
+          if-no-files-found: error

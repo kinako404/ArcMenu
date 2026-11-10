@@ -15,7 +15,8 @@
 <p align="center">
   <a href="https://github.com/FENTAIIII/ArcMenu/actions/workflows/build.yml"><img src="https://github.com/FENTAIIII/ArcMenu/actions/workflows/build.yml/badge.svg" alt="Build status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-38bdf8.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/Paper-1.21.1--26.2-8b5cf6.svg" alt="Paper 1.21.1 to 26.2">
+  <img src="https://img.shields.io/badge/Paper-1.21.1--26.3-8b5cf6.svg" alt="Paper 1.21.1 to 26.3">
+  <a href="docs/folia/README.md"><img src="https://img.shields.io/badge/Folia-26.3-22c55e.svg" alt="Folia 26.3"></a>
 </p>
 
 ArcMenu is an Advanced Menu Plugin that lets you add custom html-like menus, animations and screens to your Minecraft server — no client mods required. Everything ships through the resource pack (or even without resourcepack with limited functions) and runs server-side.
@@ -124,7 +125,11 @@ mvn clean verify
 
 The shaded server plugin is written to `paper/target/ArcMenu-3.0.0.jar`. Install it with ProtocolLib on Paper. PlaceholderAPI, Vault, PlayerPoints and CraftEngine are optional integrations; CraftEngine is the supported custom-content integration.
 
-The target range is **Paper / Minecraft Java 1.21.1–26.2**. The automated compile and test matrix covers 1.21.1, 1.21.4, 1.21.6, 1.21.11, 26.1.2 and 26.2; runtime rendering must still be accepted separately on each server version. The current editor targets **Minecraft 26.1.2 with Fabric** and requires Java 25.
+The target range is **Paper / Minecraft Java 1.21.1–26.3**. The automated compile and test matrix covers 1.21.1, 1.21.4, 1.21.6, 1.21.11, 26.1.2, 26.2 and 26.3 (`scripts/test-paper-version-matrix.sh`; CI runs 1.21.1, 1.21.11, 26.2 and 26.3); runtime rendering must still be accepted separately on each server version. The current editor targets **Minecraft 26.1.2 with Fabric** and requires Java 25.
+
+## Folia
+
+This fork also runs on **Folia** (tested on the Shiroha 26.3 fork): `plugin.yml` declares `folia-supported: true`, and all scheduling goes through region-aware schedulers — each player's menu runs on that player's owning region thread, catalog and command changes on the global region. On regular Paper every thread hop degrades to running on the main thread, so behaviour matches upstream. Minecraft 26.x (Paper and Folia) needs the ProtocolLib development build (`5.5.0-SNAPSHOT`, 9cb125f or newer for 26.3). Hot reloading ArcMenu with PlugMan-style tools is not supported on Folia; restart the server instead. See [docs/folia/README.md](docs/folia/README.md) for supported versions, the threading model, known limitations and differences from upstream.
 
 ## Project map
 

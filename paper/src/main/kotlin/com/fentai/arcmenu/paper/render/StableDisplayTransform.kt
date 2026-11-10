@@ -50,7 +50,9 @@ internal object StableDisplayTransforms {
     }
 
     fun alignHemisphere(rotation: Quaternionf, previous: Quaternionf?): Quaternionf =
-        Quaternionf(rotation).also { if (previous != null && previous.dot(it) < 0.0f) it.mul(-1.0f) }
+        Quaternionf(rotation).also {
+            if (previous != null && previous.x * it.x + previous.y * it.y + previous.z * it.z + previous.w * it.w < 0.0f) it.mul(-1.0f)
+        }
 
     /**
      * A newly shown Display may have its spawn metadata and first animated target coalesced by the
