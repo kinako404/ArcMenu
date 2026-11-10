@@ -1384,7 +1384,9 @@ class MenuSessions(
         val removed = sessions.remove(player.uniqueId) ?: return ActionResult.CONTINUE
         closeArcitx(removed)
         cancelInput(player)
-        if (removed.pointerMode == PointerMode.MOUSE && !preservePointer) pointer.end(player)
+        // Touch mode also registers the player for packet input (PointerSource.begin); without end() every later
+        // use / swing packet stays consumed after the menu closed (no block or item use until reconnect).
+        if (!preservePointer) pointer.end(player)
         ArcScheduler.remove(plugin, removed.capture)
         removed.view.close()
         if (player.isOnline) player.sendActionBar(Component.empty())
@@ -1402,7 +1404,7 @@ class MenuSessions(
     ) {
         val removed = applicationSessions.remove(player.uniqueId) ?: return
         removed.active = false
-        if (removed.pointerMode == PointerMode.MOUSE && !preservePointer) {
+        if (!preservePointer) {
             runCatching { pointer.end(player) }.onFailure {
                 plugin.logger.warning(language.log("log.app-pointer-close-failed", removed.registration.id, it.message.orEmpty()))
             }
