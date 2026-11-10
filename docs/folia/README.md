@@ -9,6 +9,7 @@
 | [folia-build.md](folia-build.md) | JOML 26.3 兼容、版本矩阵（CI / 脚本）、ProtocolLib dev-build 安装、本文档与 README |
 | [folia-runtime.md](folia-runtime.md) | 核心运行时：跨区域重锚、入口跳线程、跨玩家动作、26.3 `AcceptTeleportation`、P2 并发修补、`ArcScheduler` 新增辅助 |
 | [folia-reload-api.md](folia-reload-api.md) | reload 编排、单线程文件通道、编辑器 / workspace、公开 API 的线程契约与 `REGION_THREADING` |
+| [touch-ux.md](touch-ux.md) | 分支 `folia-touch-ux`（未合并）：touch 模式界面跟随眼高、指针用客户端上报的转角（绕开 CraftBukkit `justTeleported` 丢包）、按客户端 tick 去重点击、新回调 `onSurfaceMoved` |
 
 分支文档是各分支完成时的记录。其中留给集成的几项已在合并时处理：缺省基线对 1.21.1 编译（`ArcScheduler` 改反射）、README 的 API 章节（已补线程契约）、自定义菜单命令入口两边各做了一次跳线程（只保留 `MenuOpenCommand.execute` 里那一处）。
 
@@ -106,6 +107,7 @@ Paper 上：「是否在所属线程」都等于「是否在主线程」，实�
 - 每个玩家各一个 tick 定时器；状态异步保存。
 - `/arcmenu reload|validate|resources`、编辑器保存 / 应用、workspace 动作的回复晚 1～2 tick（IO 在文件通道上做，主线程不再被大包安装或资源重建卡住）。
 - touch 模式开着菜单走出 128 格后，菜单在玩家眼前重建（上游留在原地）。
+- `folia-touch-ux` 分支：touch 模式下界面随潜行 / 站起 / 爬行的眼高平移；包层点击按客户端 tick 去重（不再 75 ms 去抖）；菜单开着时副手交互也取消（见 [touch-ux.md](touch-ux.md)）。
 - 玩家下线即清 meta（TrMenu 语义；上游留到重启）。
 - 应用 API 的 `runLater` / `runTimer` 返回的 `BukkitTask.taskId` 恒为 -1。
 
